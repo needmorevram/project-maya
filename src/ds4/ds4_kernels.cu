@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 
 namespace strata::ds4 {
 namespace {
@@ -827,6 +828,146 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __re
     ov[c + 1] = o1 / den;
 }
 
+// ---------------------------------------------------------------- sparse attention, a block HG heads of a query
+// sparse_attn_kernel's arithmetic a head a warp: each tile's rows read (a packed one decoded) once for the block's HG
+// heads instead of once a head, into shared memory as BF16 - a packed row's products exact there (an E2M1 value times an
+// E4M3 scale has at most 6 significant bits, BF16 has 8 and FP32's range), a BF16 row as it is - and each head's dots,
+// softmax and sums in sparse_attn_kernel's order and tiles: the same bits.  A lane's dots for 32 rows at once, summed
+// over the warp by recursive halving (lane l ends with row l's sum): warp_sum's tree for each row, in 31 shuffles
+template <int HG>
+__global__ void __launch_bounds__(HG * 32) sparse_attn_hg_kernel(const float* __restrict__ q,
+                                                                 const uint16_t* __restrict__ win,
+                                                                 const uint16_t* __restrict__ ckv,
+                                                                 const uint8_t* __restrict__ ckvp,
+                                                                 const int* __restrict__ sel, int sel_stride,
+                                                                 AttnRows ar, const float* __restrict__ sink, int heads,
+                                                                 float scale, float* __restrict__ out) {
+    constexpr int d = 512, per = kAttTile * d / (HG * 32);   // (values of a row each thread decodes: 64 for HG 16)
+    extern __shared__ __align__(16) uint16_t kt[];          // [kAttTile][512] BF16
+    __shared__ float sc[HG][kAttTile];
+    const int t = blockIdx.y, lane = threadIdx.x & 31, wp = threadIdx.x >> 5, h = blockIdx.x * HG + wp;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const int* sl = sel + (size_t) t * sel_stride;
+    float qv[16], o[16];
+    {
+        const float* qr = q + ((size_t) t * heads + h) * d + lane * 16;
+#pragma unroll
+        for (int x = 0; x < 16; ++x) {
+            qv[x] = qr[x];
+            o[x] = 0.0f;
+        }
+    }
+    // a row's 16 values of this lane (dims lane * 16 ..): BF16 pairs a word, the low one first
+    auto row16 = [&](int j, float (&v)[16]) {
+        const uint4 a = *(const uint4*) (kt + (size_t) j * d + lane * 16);
+        const uint4 b = *(const uint4*) (kt + (size_t) j * d + lane * 16 + 8);
+        const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            v[2 * i] = __uint_as_float(w[i] << 16);
+            v[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
+        }
+    };
+    float m_run = -1e30f, den = 0.0f;
+    const int total = n_win + n_sel;
+    for (int t0 = 0; t0 < total; t0 += kAttTile) {
+        const int nt = min(kAttTile, total - t0);
+        __syncthreads();   // (the last tile read by every warp)
+        {   // thread i: row i / (512 / per), its values [c0, c0 + per)
+            const int j = threadIdx.x / (d / per), c0 = threadIdx.x % (d / per) * per, jj = t0 + j;
+            if (j < nt) {
+                uint16_t* dst = kt + (size_t) j * d + c0;
+                const uint16_t* src = jj < n_win ? wbase + (size_t) jj * d
+                                    : ckvp == nullptr ? ckv + (size_t) sl[jj - n_win] * d : nullptr;
+                if (src != nullptr) {
+                    for (int i = 0; i < per; i += 8) *(uint4*) (dst + i) = *(const uint4*) (src + c0 + i);
+                } else {
+                    const uint8_t* rr = ckvp + (size_t) sl[jj - n_win] * (512 / 2 + 512 / 16);
+                    for (int i = 0; i < per; i += 16) {   // 16 values: 8 code bytes, one scale
+                        const uint2 w = *(const uint2*) (rr + (c0 + i) / 2);
+                        const float ks = e4m3v(rr[256 + (c0 + i) / 16]);
+                        uint32_t hv[8];
+#pragma unroll
+                        for (int x = 0; x < 4; ++x) {
+                            hv[x] = (uint32_t) f2bf16(__fmul_rn(fp4v((w.x >> (8 * x)) & 15u), ks)) |
+                                    ((uint32_t) f2bf16(__fmul_rn(fp4v((w.x >> (8 * x + 4)) & 15u), ks)) << 16);
+                            hv[4 + x] = (uint32_t) f2bf16(__fmul_rn(fp4v((w.y >> (8 * x)) & 15u), ks)) |
+                                        ((uint32_t) f2bf16(__fmul_rn(fp4v((w.y >> (8 * x + 4)) & 15u), ks)) << 16);
+                        }
+                        *(uint4*) (dst + i) = make_uint4(hv[0], hv[1], hv[2], hv[3]);
+                        *(uint4*) (dst + i + 8) = make_uint4(hv[4], hv[5], hv[6], hv[7]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        for (int k0 = 0; k0 < nt; k0 += 32) {   // this head's dots, 32 rows at once
+            float p[32];
+#pragma unroll
+            for (int k = 0; k < 32; ++k) {
+                float s = 0.0f;
+                if (k0 + k < nt) {
+                    float kv[16];
+                    row16(k0 + k, kv);
+#pragma unroll
+                    for (int x = 0; x < 16; ++x) s += qv[x] * kv[x];
+                }
+                p[k] = s;
+            }
+#pragma unroll
+            for (int off = 16, n = 32; off > 0; off >>= 1, n >>= 1) {   // keep the half of the rows this lane's bit names
+                const bool up = (lane & off) != 0;
+#pragma unroll
+                for (int k = 0; k < n / 2; ++k) {
+                    const float send = up ? p[k] : p[k + n / 2], keep = up ? p[k + n / 2] : p[k];
+                    p[k] = keep + __shfl_xor_sync(0xffffffffu, send, off);
+                }
+            }
+            if (k0 + lane < nt) sc[wp][k0 + lane] = p[0] * scale;
+        }
+        __syncwarp();
+        float m = -INFINITY;
+        for (int j = lane; j < nt; j += 32) m = fmaxf(m, sc[wp][j]);
+        m = warp_max(m);
+        const float m_old = m_run;
+        const float m_new = fmaxf(m_old, m);
+        float s = 0.0f;
+        for (int j = lane; j < nt; j += 32) {
+            const float pj = expf(sc[wp][j] - m_new);
+            sc[wp][j] = pj;
+            s += pj;
+        }
+        s = warp_sum(s);
+        __syncwarp();
+        const float cs = expf(m_old - m_new);
+        den = den * cs + s;
+        m_run = m_new;
+#pragma unroll
+        for (int x = 0; x < 16; ++x) o[x] *= cs;
+        for (int j = 0; j < nt; ++j) {
+            const float pj = sc[wp][j];
+            float v[16];
+            row16(j, v);
+#pragma unroll
+            for (int x = 0; x < 16; ++x) o[x] += pj * v[x];
+        }
+    }
+    const float dn = den + expf(sink[h] - m_run);
+    float* ov = out + ((size_t) t * heads + h) * d + lane * 16;
+#pragma unroll
+    for (int x = 0; x < 16; ++x) ov[x] = o[x] / dn;
+}
+
 __global__ void ring_to_ext_kernel(const uint16_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0, int n,
                                    int d) {
     const int r = blockIdx.x;
@@ -1608,8 +1749,35 @@ void sparse_attn(const float* q, const uint16_t* win, const uint16_t* ckv, const
         std::fprintf(stderr, "ds4 sparse_attn: head dim %d not covered\n", d);
         return;
     }
-    sparse_attn_kernel<<<dim3(heads, T), kThreads, 0, s>>>(q, win, ckv, ckv_packed, sel, sel_stride, a, sink, heads, d,
-                                                           scale, out);
+    // HG heads a block where the queries fill the device with them (a prompt's chunk), else a block a head (decode's
+    // few queries); DS4_ATTN_HG=1 / 8 / 16 picks one (the same bits whichever)
+    const char* hg_s = std::getenv("DS4_ATTN_HG");   // (read each call: the parity test switches it)
+    const int hg_env = hg_s != nullptr ? std::atoi(hg_s) : 0;
+    const int hg = hg_env > 0 ? hg_env : (heads % 16 == 0 && T >= 64) ? 16 : (heads % 8 == 0 && T >= 128) ? 8 : 1;
+    const size_t smem = (size_t) kAttTile * 512 * 2;
+    if (hg == 16 && heads % 16 == 0) {
+        static bool set[64] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (!set[dev & 63]) {
+            cudaFuncSetAttribute(sparse_attn_hg_kernel<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+            set[dev & 63] = true;
+        }
+        sparse_attn_hg_kernel<16><<<dim3(heads / 16, T), 16 * 32, smem, s>>>(q, win, ckv, ckv_packed, sel, sel_stride, a,
+                                                                              sink, heads, scale, out);
+    } else if (hg == 8 && heads % 8 == 0) {
+        static bool set[64] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (!set[dev & 63]) {
+            cudaFuncSetAttribute(sparse_attn_hg_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+            set[dev & 63] = true;
+        }
+        sparse_attn_hg_kernel<8><<<dim3(heads / 8, T), 8 * 32, smem, s>>>(q, win, ckv, ckv_packed, sel, sel_stride, a,
+                                                                          sink, heads, scale, out);
+    } else
+        sparse_attn_kernel<<<dim3(heads, T), kThreads, 0, s>>>(q, win, ckv, ckv_packed, sel, sel_stride, a, sink, heads,
+                                                               d, scale, out);
 }
 
 void ring_to_ext(const uint16_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {

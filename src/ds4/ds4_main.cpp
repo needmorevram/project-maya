@@ -653,6 +653,10 @@ int main(int argc, char** argv) {
     const std::string dpath = reps > 1 ? dump + "." + std::to_string(rep) : dump;
     std::FILE* df = dump.empty() ? nullptr : std::fopen(dpath.c_str(), "wb");
     std::vector<float> lg;
+    // DS4_PROFILE_PROMPT: the prompt alone in the capture (nsys --capture-range=cudaProfilerApi), the last pass
+    const bool prof_prompt = std::getenv("DS4_PROFILE_PROMPT") != nullptr && rep == reps - 1;
+    const strata::ds4::Stats sp = m.stats();
+    if (prof_prompt) cudaProfilerStart();
     const double t0 = now_ms();
     for (size_t a = 0; a < ids.size();) {
         const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
@@ -666,9 +670,12 @@ int main(int argc, char** argv) {
     }
     m.set_images({});
     const double t1 = now_ms();
+    if (prof_prompt) cudaProfilerStop();
     std::fprintf(stderr, "prompt: %zu tokens in %.0f ms (%.2f tok/s, windows of %d)\n", ids.size(), t1 - t0,
                  1000.0 * (double) ids.size() / (t1 - t0), window);
     const strata::ds4::Stats s0 = m.stats();
+    std::fprintf(stderr, "prompt's host time: layers %.0f ms, head wait %.0f, Engram waits %.0f, CPU lane %.0f\n",
+                 s0.layer_ms - sp.layer_ms, s0.head_ms - sp.head_ms, s0.engram_ms - sp.engram_ms, s0.cpu_ms - sp.cpu_ms);
     const bool prof = std::getenv("DS4_PROFILE") != nullptr;   // (nsys --capture-range=cudaProfilerApi: the decode alone)
     if (prof && rep == reps - 1) cudaProfilerStart();   // (the last pass)
     std::vector<int> out;

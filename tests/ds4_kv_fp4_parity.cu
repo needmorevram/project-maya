@@ -216,6 +216,76 @@ int main() {
         }
         fails += !same;
     }
+    // sparse_attn's kernels (DS4_ATTN_HG: a block a head, or 8 / 16 heads a block reading each row once): a prompt
+    // chunk's queries (gen rows: the window buffer, then min(kcap, (pos + 1) / R) selected rows), packed and BF16
+    // compressed rows - the same bits from all three
+    {
+        const int n = 4000, d = 512, T = 200, win = 128, kcap = 512;
+        uint16_t* cb = nullptr;
+        uint8_t* cp = nullptr;
+        fails += finish_parity(n, d, 2, rng, &cb, &cp);
+        std::normal_distribution<float> nd;
+        std::uniform_int_distribution<int> pos(0, n - 1);
+        for (int heads : {16, 64}) {
+            std::vector<float> q((size_t) T * heads * d), sink(heads);
+            for (float& v : q) v = nd(rng) * 0.05f;
+            for (float& v : sink) v = nd(rng);
+            std::vector<uint16_t> ext((size_t) (win + T) * d);
+            for (uint16_t& v : ext) {
+                const float f = nd(rng);
+                uint32_t u;
+                std::memcpy(&u, &f, 4);
+                v = (uint16_t) (u >> 16);
+            }
+            std::vector<int> sel((size_t) T * kcap);
+            for (int& v : sel) v = pos(rng);
+            float *dq, *dsink, *o[3];
+            uint16_t* dext;
+            int* dsel;
+            CK(cudaMalloc(&dq, q.size() * 4));
+            CK(cudaMalloc(&dsink, sink.size() * 4));
+            CK(cudaMalloc(&dext, ext.size() * 2));
+            CK(cudaMalloc(&dsel, sel.size() * 4));
+            for (float*& x : o) CK(cudaMalloc(&x, q.size() * 4));
+            CK(cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dsink, sink.data(), sink.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dext, ext.data(), ext.size() * 2, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(dsel, sel.data(), sel.size() * 4, cudaMemcpyHostToDevice));
+            for (int R : {1, 2})
+                for (int packed = 0; packed < 2; ++packed)
+                    for (long long p0 : {0LL, 300LL, 9000LL}) {   // (from the start: few rows; far in: kcap of them)
+                        AttnRows ar;
+                        ar.gen = 1, ar.t0 = 0, ar.win = win, ar.R = R, ar.kcap = kcap, ar.p0 = p0;
+                        const float scale = 1.0f / std::sqrt((float) d);
+                        const char* hgs[3] = {"1", "8", "16"};
+                        float ms[3] = {};
+                        for (int k = 0; k < 3; ++k) {
+                            setenv("DS4_ATTN_HG", hgs[k], 1);
+                            cudaEvent_t e0, e1;
+                            CK(cudaEventCreate(&e0));
+                            CK(cudaEventCreate(&e1));
+                            CK(cudaEventRecord(e0));
+                            sparse_attn(dq, dext, packed ? nullptr : cb, packed ? cp : nullptr, dsel, kcap, ar, dsink,
+                                        heads, d, T, scale, o[k], nullptr);
+                            CK(cudaEventRecord(e1));
+                            CK(cudaEventSynchronize(e1));
+                            CK(cudaEventElapsedTime(&ms[k], e0, e1));
+                        }
+                        unsetenv("DS4_ATTN_HG");
+                        CK(cudaDeviceSynchronize());
+                        std::vector<float> a(q.size()), b(q.size()), c(q.size());
+                        CK(cudaMemcpy(a.data(), o[0], a.size() * 4, cudaMemcpyDeviceToHost));
+                        CK(cudaMemcpy(b.data(), o[1], b.size() * 4, cudaMemcpyDeviceToHost));
+                        CK(cudaMemcpy(c.data(), o[2], c.size() * 4, cudaMemcpyDeviceToHost));
+                        const bool same = std::memcmp(a.data(), b.data(), a.size() * 4) == 0 &&
+                                          std::memcmp(a.data(), c.data(), a.size() * 4) == 0;
+                        std::printf("sparse_attn kernels, %d heads x %d queries, R %d, %s rows, from %lld: %s "
+                                    "(%.2f / %.2f / %.2f ms)\n", heads, T, R, packed ? "packed" : "BF16", p0,
+                                    same ? "bit for bit" : "DIFFERENT", ms[0], ms[1], ms[2]);
+                        fails += !same;
+                    }
+        }
+    }
     // the hand-offs of a window's new rows to the other devices (xfer_put to host-mapped memory, xfer_get back): the
     // compressed KV's 288-byte rows and the index keys' 68-byte ones from row g_first, ng of them - every byte there,
     // none past them (the rows used to go in 16-byte units: a misaligned address off the 16, the last bytes left out)
