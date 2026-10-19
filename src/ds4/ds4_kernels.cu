@@ -1487,6 +1487,35 @@ __global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, flo
         if (q < c0 || q >= c1) x4[q] = from_h4(__ldcv(sum + q));
 }
 
+// allreduce_dma's pieces: this member's partial as FP16 (ar_rs16's rounding), its slice's sum from the members' FP16
+// partials in member order, and the other slices' sums back to F32
+__global__ void ar_to16_kernel(const float4* __restrict__ x, int n4, uint2* __restrict__ h) {
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x) h[q] = to_h4(sat4(x[q]));
+}
+__global__ void ar_sum16_kernel(float4* x, uint2* own, const uint2* __restrict__ peers, size_t pstride, int nm, int mi,
+                                int q0, int q1) {
+    for (int q = q0 + blockIdx.x * blockDim.x + threadIdx.x; q < q1; q += gridDim.x * blockDim.x) {
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int m = 0; m < nm; ++m) {
+            const float4 p = from_h4(m == mi ? own[q] : peers[(size_t) m * pstride + (q - q0)]);
+            if (m == 0) v = p;
+            else {
+                v.x = __fadd_rn(v.x, p.x);
+                v.y = __fadd_rn(v.y, p.y);
+                v.z = __fadd_rn(v.z, p.z);
+                v.w = __fadd_rn(v.w, p.w);
+            }
+        }
+        const uint2 s16 = to_h4(sat4(v));
+        own[q] = s16;
+        x[q] = from_h4(s16);
+    }
+}
+__global__ void ar_from16_kernel(float4* x, const uint2* __restrict__ h, int n4, int q0, int q1) {
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
+        if (q < q0 || q >= q1) x[q] = from_h4(h[q]);
+}
+
 // x[i] = the members' partials summed in member order (this member's from x, the others' from their host rows)
 __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, const float* peers, size_t stride,
                                                          const unsigned* flags, int nm, int mi, int slot, int slots,
@@ -1603,15 +1632,19 @@ __global__ void moe_combine_kernel(float* acc, const float* __restrict__ y, cons
                                    const float* __restrict__ w, int k, int r0, int r1, int dim) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= dim) return;
+    bool any = false;   // (a token without rows here leaves acc unread: a chunk's set covers a few of its tokens)
+    for (int i = 0; i < k; ++i) {
+        const int r = pos[(size_t) t * kPicks + i];
+        any = any || (r >= r0 && r < r1);
+    }
+    if (!any) return;
     float a = acc[(size_t) t * dim + e];
-    bool any = false;
     for (int i = 0; i < k; ++i) {
         const int r = pos[(size_t) t * kPicks + i];
         if (r < r0 || r >= r1) continue;
         a = __fmaf_rn(w[(size_t) t * kPicks + i], y[(size_t) (r - r0) * dim + e], a);
-        any = true;
     }
-    if (any) acc[(size_t) t * dim + e] = a;
+    acc[(size_t) t * dim + e] = a;
 }
 
 int cdiv(int a, int b) { return (a + b - 1) / b; }
@@ -1874,6 +1907,39 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     const int n4 = n / 4;
     const int blocks = std::max(1, std::min(64, cdiv(n4, kThreads)));
     ar_sum_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
+}
+
+void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s) {
+    const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm;
+    const int n4 = n / 4, cq = (n4 + nm - 1) / nm;
+    const int c0 = std::min(n4, mi * cq), c1 = std::min(n4, (mi + 1) * cq);
+    uint2* own = (uint2*) scratch;   // this member's FP16 partial (a uint2 a float4), then the sums
+    uint2* peers = own + n4;         // [nm][cq]: the members' partials of slice mi
+    auto hrow = [&](int m) { return (uint2*) (a.data + ((size_t) m * a.slots + slot) * a.stride); };
+    uint2* hsum = (uint2*) (a.sums + (size_t) slot * a.stride);
+    // (ar_rs16_kernel's first block's flags: member m's partial out at rf + m * fs, its sums at sf + m * fs)
+    unsigned* rf = a.bflags + (size_t) slot * kArBlocks * 8;
+    unsigned* sf = a.bflags + ((size_t) nm * a.slots + slot) * kArBlocks * 8;
+    const int fs = a.slots * kArBlocks * 8;
+    const int blocks = std::max(1, std::min(1024, cdiv(n4, kThreads)));
+    ar_to16_kernel<<<blocks, kThreads, 0, s>>>((const float4*) x, n4, own);
+    if (c0 > 0) cudaMemcpyAsync(hrow(mi), own, (size_t) c0 * 8, cudaMemcpyDeviceToHost, s);   // (the others' slices)
+    if (c1 < n4) cudaMemcpyAsync(hrow(mi) + c1, own + c1, (size_t) (n4 - c1) * 8, cudaMemcpyDeviceToHost, s);
+    set_flag_kernel<<<1, 1, 0, s>>>(rf + (size_t) mi * fs, seq);
+    wait_flags_kernel<<<1, 32, 0, s>>>(rf, nm, fs, seq);
+    if (c1 > c0) {
+        for (int m = 0; m < nm; ++m)
+            if (m != mi)
+                cudaMemcpyAsync(peers + (size_t) m * cq, hrow(m) + c0, (size_t) (c1 - c0) * 8, cudaMemcpyHostToDevice, s);
+        ar_sum16_kernel<<<std::max(1, std::min(1024, cdiv(c1 - c0, kThreads))), kThreads, 0, s>>>(
+            (float4*) x, own, peers, (size_t) cq, nm, mi, c0, c1);
+        cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDeviceToHost, s);
+    }
+    set_flag_kernel<<<1, 1, 0, s>>>(sf + (size_t) mi * fs, seq);
+    wait_flags_kernel<<<1, 32, 0, s>>>(sf, nm, fs, seq);
+    if (c0 > 0) cudaMemcpyAsync(own, hsum, (size_t) c0 * 8, cudaMemcpyHostToDevice, s);
+    if (c1 < n4) cudaMemcpyAsync(own + c1, hsum + c1, (size_t) (n4 - c1) * 8, cudaMemcpyHostToDevice, s);
+    ar_from16_kernel<<<blocks, kThreads, 0, s>>>((float4*) x, own, n4, c0, c1);
 }
 
 }  // namespace strata::ds4

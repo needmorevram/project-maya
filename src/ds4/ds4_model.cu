@@ -1847,7 +1847,7 @@ struct Model::Impl {
                       dalloc(d, c.rw, C * kPicks, err) && dalloc(d, c.bounds, 2048, err) &&
                       dalloc(d, c.row_tok, C * kPicks, err) && dalloc(d, c.pos, C * kPicks, err) &&
                       dalloc(d, c.sg, C * FF, err) && dalloc(d, c.su, C * FF, err) && dalloc(d, c.sh16, C * FF, err) &&
-                      dalloc(d, c.h16, C * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
+                      dalloc(d, c.h16, C * FF, err) && dalloc(d, c.y, C * D + 32, err) && dalloc(d, c.w16, c.w16_elems, err) &&
                       halloc(c.bounds_pin, 2048, err);
             if (!ok) return false;
             if (has_first && !dalloc(d, c.emb, C * D, err)) return false;
@@ -3658,6 +3658,17 @@ struct Model::Impl {
     // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
     // projections as GEMMs, the attention and the indexer in slabs, the routed experts as sorted rows: the VRAM ones in
     // place, the CPU lane's streamed in batches)
+    // a chunk's sum over its group: three members or more through the copy engines (allreduce_dma, c.y its scratch:
+    // free between the MoE's sets), unless DS4_AR_DMA=0
+    void chunk_allreduce(Dev& d, Chunk& c, const ArGroup& ab, int mi, int n, cudaStream_t s) {
+        static const bool dma = [] {
+            const char* e = std::getenv("DS4_AR_DMA");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        if (dma && ab.nm > 2 && ab.sums != nullptr && ab.bflags != nullptr) allreduce_dma(c.acc, n, ab, mi, ++c.arb_seq, c.y, s);
+        else allreduce(c.acc, n, ab, mi, ++c.arb_seq, d.xcnt, s);
+    }
+
     bool layer_chunk(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err) {
         Layer& l = member(L0, mi);
         Dev& d = devs[(size_t) l.dev];
@@ -3866,7 +3877,7 @@ struct Model::Impl {
             x3::rows_f16(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s);
             if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
         }
-        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
         // the MoE
         if (!hc_mix_chunk(d, c, c.h, l.hcf_fn, T, c.mix, err)) return false;
@@ -3922,7 +3933,7 @@ struct Model::Impl {
             v_done = v_to;
         }
         if (!run_set(d, c, l, l.vram_base, 0, unit(l), c.bounds, b.data(), v_done, L0.n_slots, T, err)) return false;
-        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         return true;
