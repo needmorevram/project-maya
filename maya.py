@@ -425,11 +425,18 @@ DS4_EFFORT = "high"                                 # (encoding.py's default: a 
 DS4_MEMORY_GB = 230                                 # VRAM + RAM that hold it all (211 GB of weights, the pinned
                                                     # tables); with less the engine reads experts from the SSD
 DS4_35 = DS4 + "-3.5bpw"                            # the same model in LibertAIDAI's EXL3 quant at 3.5 bits
-# the DeepSeek quants (--model): each one's manifest, the GB of its weights and the VRAM + RAM that hold all of it (their
-# card: perplexity over the unquantized model's on held-out code / prose +1.8% / +0.4% at 2.9 bits, +0.8% / +0.1% at 3.5)
-DS4_QUANTS = {DS4: {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211, "memory_gb": DS4_MEMORY_GB},
+DS4_162 = DS4 + "-1.62bpw"                          # vcruz305's SAGE EXL3 quant: experts at 1.62 bits, the rest FP8
+# the DeepSeek quants (--model): each one's manifest, the GB of its weights and the VRAM + RAM that hold all of it, who
+# made it (their cards: perplexity over the unquantized model's on held-out code / prose +1.8% / +0.4% at 2.9 bits,
+# +0.8% / +0.1% at 3.5; the SAGE pack's: 94.5% top-1 agreement, mean KL 0.098 against DeepSeek's FP8 / FP4 release)
+# (slow: what one RTX 3090 and 64 GB of RAM measured, the experts that do not fit read from the SSD)
+DS4_QUANTS = {DS4: {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211, "memory_gb": DS4_MEMORY_GB,
+                    "by": "LibertAIDAI's EXL3 quant", "slow": "prompts ~50 tokens/s, answers ~4-5 tokens/s"},
               DS4_35: {"bits": "3.5", "manifest": ROOT / "tools" / "ds4" / "download-3.5bpw.json", "weights_gb": 258,
-                       "memory_gb": 280}}
+                       "memory_gb": 280, "by": "LibertAIDAI's EXL3 quant"},
+              DS4_162: {"bits": "1.62", "manifest": ROOT / "tools" / "ds4" / "download-1.62bpw.json", "weights_gb": 124,
+                        "memory_gb": 145, "by": "vcruz305's SAGE EXL3 quant (its attention and drafter in FP8)",
+                        "slow": "prompts ~220 tokens/s, answers ~6-9 tokens/s"}}
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 # the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
@@ -987,10 +994,11 @@ def check_pc(a, family: str = "glm") -> dict:
         qn = a.model if getattr(a, "model", None) in DS4_QUANTS else DS4
         q = DS4_QUANTS[qn]
         if vram + total < q["memory_gb"]:
+            slow = q.get("slow") and q["bits"] or "2.9"
             warn(f"{msg}; with {vram:.0f} GB of VRAM that is below the ~{q['memory_gb']} GB that hold all of {qn}'s "
                  f"{q['weights_gb']} GB of weights, so the experts that do not fit are read from the model's files on "
-                 "the SSD, much slower (2.9 bits, one RTX 3090 and 64 GB measured: prompts ~50 tokens/s, answers ~4-5 "
-                 "tokens/s). More GPUs (--gpus) or RAM make it faster")
+                 f"the SSD, much slower ({slow} bits, one RTX 3090 and 64 GB measured: "
+                 f"{q.get('slow') or DS4_QUANTS[DS4]['slow']}). More GPUs (--gpus) or RAM make it faster")
         else:
             ok(msg + f"; with {vram:.0f} GB of VRAM that holds {qn}")
         if len(chosen) % 2 or len({round(g["vram_gb"]) for g in chosen}) > 1:
@@ -1147,12 +1155,18 @@ def choose_family(a, prev: dict) -> str:
              "download - the tables are linked, not downloaded again, when the 2.9-bit quant is set up beside it): "
              "closer to the unquantized model (its card: +0.8% perplexity on code against +1.8% at 2.9 bits), "
              f"slower - more of its experts run from RAM; about {DS4_QUANTS[DS4_35]['memory_gb']} GB of VRAM and RAM "
-             f"together{here}.")]
+             f"together{here}."),
+            (DS4_162, "experimental",
+             "The same model in vcruz305's SAGE EXL3 quant: its routed experts at 1.62 bits (each matrix its own 1-4 "
+             "bits), its attention, shared experts and drafter in DeepSeek's own FP8 (124 GB; with the Engram tables "
+             "327 GB to download - the tables are linked from another DeepSeek quant set up beside it): the smallest, "
+             "so the most of its experts fit in VRAM (its card: 94.5% top-1 agreement with DeepSeek's FP8 / FP4 "
+             f"release); about {DS4_QUANTS[DS4_162]['memory_gb']} GB of VRAM and RAM together{here}.")]
     quant = (prev.get("installer") or {}).get("quant")
-    start = 0 if default == "glm" else 2 if quant == DS4_35 else 1
+    start = 0 if default == "glm" else 2 if quant == DS4_35 else 3 if quant == DS4_162 else 1
     pick = choose("Model?", ["Which model to set up:"], rows, start, a.yes)
     if pick:
-        a.model = DS4_35 if pick == 2 else DS4
+        a.model = {2: DS4_35, 3: DS4_162}.get(pick, DS4)
     return "glm" if pick == 0 else "deepseek"
 
 
@@ -3013,8 +3027,9 @@ def ds4_model(quant: str = DS4) -> dict:
     if not man.get("files") or not eg.get("files"):
         fail(f"{q['manifest']} is missing or damaged", f"restore it (git checkout tools/ds4/{q['manifest'].name})")
     both = {**man["files"], **eg["files"]}
-    return {"about": f"{DS4} in LibertAIDAI's EXL3 quant at {q['bits']} bits per weight (with its DSpark drafter and "
-                     "vision tower), and the two Engram tables of DeepSeek's base repo", "format": "ds4",
+    eg_from = "DeepSeek's base repo" if eg.get("repo") != man["repo"] else "its repo (DeepSeek's own)"
+    return {"about": f"{DS4} in {q['by']} at {q['bits']} bits per weight (with its DSpark drafter and vision tower), "
+                     f"and the two Engram tables of {eg_from}", "format": "ds4",
             "repo": man["repo"], "revision": man["revision"], "folder": "",
             "files": {k: v[0] for k, v in both.items()}, "sha256": {k: v[1] for k, v in both.items()},
             "sources": {k: (eg["repo"], eg["revision"]) for k in eg["files"]},
@@ -3026,9 +3041,15 @@ def ds4_shards(d: Path) -> list:
     return sorted(p for p in d.glob("*.safetensors"))
 
 
+def ds4_repo_dir(models: Path, quant: str) -> Path:
+    """<models folder>/<the quant repo's own name>: where a download of the repo made by hand lands."""
+    return models / str(read_json(DS4_QUANTS[quant]["manifest"]).get("repo", quant)).split("/")[-1]
+
+
 def ds4_dir(a, models: Path, prev: dict, quant: str = DS4) -> Path:
     """The model's folder: --model-dir, else the folder of the DeepSeek setup before when it set up the same quant (its
-    pack is inside it), else <models folder>/<the quant's name> (DeepSeek-V4.1-Flash-1017 for 2.9 bits)."""
+    pack is inside it), else <models folder>/<the quant's name> (DeepSeek-V4.1-Flash-1017 for 2.9 bits) - or, where
+    only that is there, <models folder>/<its repo's name> (a download made by hand)."""
     if a.model_dir:
         return Path(a.model_dir).expanduser().resolve()
     args = prev.get("args") or []
@@ -3037,30 +3058,47 @@ def ds4_dir(a, models: Path, prev: dict, quant: str = DS4) -> Path:
         d = Path(args[args.index("--pack") + 1]).parent
         if (d / "config.json").exists():
             return d
+    own = ds4_repo_dir(models, quant)
+    if not (models / quant).exists() and (own / "config.json").exists():
+        return own
     return models / quant
+
+
+def ds4_engram_names(sha: str) -> list:
+    """Every DeepSeek quant's file name for the Engram table of this sha256 (the same bytes under each repo's own shard
+    names: DeepSeek's 47 / 48 of 48, the SAGE pack's 16 / 17 of 17)."""
+    names = []
+    for q in DS4_QUANTS.values():
+        for n, v in ((read_json(q["manifest"]).get("engram") or {}).get("files") or {}).items():
+            if v[1] == sha and n not in names:
+                names.append(n)
+    return names
 
 
 def ds4_link_engram(d: Path, m: dict, models: Path, prev: dict):
     """The Engram tables are the same for every quant: missing in d but whole in another DeepSeek folder (the other
-    quants' folders, the configs' model folders), hard-linked from it - no second download, no second copy on the
-    disk - with its sha256 record.  Anything else (another drive: no hard link) leaves them to the download."""
-    dirs = [models / q for q in DS4_QUANTS] + [Path(p) for p in
+    quants' folders and their repos' own, the configs' model folders) - under its name there or another quant's for
+    the same bytes (ds4_engram_names) - hard-linked from it: no second download, no second copy on the disk - with its
+    sha256 record.  Anything else (another drive: no hard link) leaves them to the download."""
+    dirs = [models / q for q in DS4_QUANTS] + [ds4_repo_dir(models, q) for q in DS4_QUANTS] + [Path(p) for p in
             [((read_json(c).get("installer") or {}).get("model_dir")) for c in configs()] + [(prev.get("installer") or
             {}).get("model_dir")] if p]
     for name in (m.get("sources") or {}):
         dst = d / name
         if dst.exists():
             continue
+        alts = [name] + [n for n in ds4_engram_names((m.get("sha256") or {}).get(name, "")) if n != name]
+        src = o = None
         for o in dict.fromkeys(x.resolve() for x in dirs if x.exists()):
-            src = o / name
-            if o == d.resolve() or not src.exists() or src.stat().st_size != m["files"][name]:
+            src = next((o / n for n in alts if (o / n).exists() and (o / n).stat().st_size == m["files"][name]), None)
+            if o == d.resolve() or src is None:
                 continue
             try:
                 d.mkdir(parents=True, exist_ok=True)
                 os.link(src, dst)
             except OSError:
                 continue
-            seen = read_json(o / VERIFIED).get(name)
+            seen = read_json(o / VERIFIED).get(src.name)
             if seen:   # (a hard link: the same size and time - its check still holds)
                 book = read_json(d / VERIFIED)
                 book[name] = seen
@@ -3068,7 +3106,7 @@ def ds4_link_engram(d: Path, m: dict, models: Path, prev: dict):
                     (d / VERIFIED).write_text(json.dumps(book, indent=1), encoding="utf-8")
                 except OSError:
                     pass
-            ok(f"{name}: linked from {o} (the same Engram table for every quant)")
+            ok(f"{name}: linked from {src} (the same Engram table for every quant)")
             break
 
 
@@ -3238,7 +3276,7 @@ def main() -> int:
     ap.add_argument("--download-model", action="store_true",
                     help="download the model without asking (the commands and the size are still printed)")
     ap.add_argument("--model", choices=list(MODELS) + list(DS4_QUANTS),
-                    help=f"which model (default: asked): {DS4} (2.9 bits) or {DS4_35}, or a GLM-5.3-Flash download "
+                    help=f"which model (default: asked): {DS4} (2.9 bits), {DS4_35} or {DS4_162}, or a GLM-5.3-Flash download "
                          f"({next(iter(MODELS))} recommended)")
     ap.add_argument("--model-dir", help=f"use {DS4}'s files you already have: their folder (the EXL3 quant's files "
                                         "and the Engram shards 47 / 48 of DeepSeek's repo); it must be writable - the "

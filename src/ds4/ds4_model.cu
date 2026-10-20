@@ -104,23 +104,53 @@ std::vector<int> cpu_list(const std::string& s) {   // "0-3,8,10-11"
     return v;
 }
 // each NUMA node's physical cores (the first logical CPU of each core), in order
-std::vector<std::vector<int>> node_cores() {
+// each NUMA node's physical cores (one thread of each), of the ones this process may run on and allocate from (its
+// affinity - taskset, numactl --cpunodebind, a cpuset - its Mems_allowed_list and a numactl --membind); ids: each node's
+std::vector<std::vector<int>> node_cores(std::vector<int>* ids = nullptr) {
     std::vector<std::vector<int>> nodes;
+    cpu_set_t aff;
+    CPU_ZERO(&aff);
+    const bool have_aff = sched_getaffinity(0, sizeof aff, &aff) == 0;
+    std::vector<int> mems;
+    {
+        std::istringstream st(read_file("/proc/self/status"));
+        std::string line;
+        while (std::getline(st, line))
+            if (line.rfind("Mems_allowed_list:", 0) == 0) mems = cpu_list(line.substr(line.find(':') + 1));
+    }
+    unsigned long bind[4] = {0, 0, 0, 0};   // (numactl --membind: the process's MPOL_BIND nodes)
+    int mode = 0;
+    const bool bound = syscall(SYS_get_mempolicy, &mode, bind, 256, nullptr, 0) == 0 && mode == 2 /* MPOL_BIND */;
+    if (ids != nullptr) ids->clear();
     for (int n = 0; n < 64; ++n) {
         const std::string cl = read_file("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist");
         if (cl.empty()) break;
+        if (!mems.empty() && std::find(mems.begin(), mems.end(), n) == mems.end()) continue;
+        if (bound && !(bind[n / 64] >> (n % 64) & 1ul)) continue;
         std::vector<int> cores;
         for (int c : cpu_list(cl)) {
+            if (have_aff && !CPU_ISSET(c, &aff)) continue;
             const std::vector<int> sib = cpu_list(
                 read_file("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/topology/thread_siblings_list"));
-            if (sib.empty() || sib[0] == c) cores.push_back(c);
+            // (the core's first allowed thread)
+            int first = c;
+            for (int t : sib)
+                if (!have_aff || CPU_ISSET(t, &aff)) {
+                    first = t;
+                    break;
+                }
+            if (first == c) cores.push_back(c);
         }
-        if (!cores.empty()) nodes.push_back(cores);
+        if (!cores.empty()) {
+            nodes.push_back(cores);
+            if (ids != nullptr) ids->push_back(n);
+        }
     }
     if (nodes.empty()) {
         std::vector<int> all;
         for (unsigned c = 0; c < std::max(1u, std::thread::hardware_concurrency() / 2); ++c) all.push_back((int) c);
         nodes.push_back(all);
+        if (ids != nullptr) ids->assign(1, -1);
     }
     return nodes;
 }
@@ -889,15 +919,35 @@ struct Model::Impl {
     uint16_t* embed_pinned = nullptr;
     std::vector<float> freqs_win, freqs_comp;
     std::vector<std::unique_ptr<Pool>> pools;   // one per NUMA node, its workers on that node's cores
-    std::vector<std::vector<int>> cores;        // each node's physical cores
+    std::vector<std::vector<int>> cores;        // each node's physical cores (the ones this process may use)
+    std::vector<int> node_ids;                  // and the node each is (node_map's)
     int NH = 1;                                 // the CPU lane's parts of an expert (the NUMA nodes)
     // the CPU lane's experts read in place from the model's files (one part, the files' layout; the page cache keeps
     // what fits) instead of copied into RAM, and how much of them the load reads ahead (the most-routed first)
     bool file_experts = false;
     uint64_t warm_bytes = 0;
     static constexpr uint64_t kRamMargin = 8ull << 30;   // RAM left to the rest (the system, the page cache's churn)
+    // expert e's region in place (pieces apart: its first piece - the CPU lane takes each piece's own, piece_at)
     uint8_t* file_part(const Layer& l, int e) const {
+        if (!l.poff.empty()) return piece_at(l, e, 0, 0);
         return pk.maps[(size_t) l.region_file[(size_t) e]].first + l.region_off[(size_t) e];
+    }
+    uint8_t* piece_at(const Layer& l, int e, int r, int q) const {
+        const size_t i = (size_t) (3 * r + q);
+        return pk.maps[(size_t) l.pfile[(size_t) e][i]].first + l.poff[(size_t) e][i];
+    }
+    // posix_fadvise of expert e's file region (pieces apart: each piece's)
+    void advise_region(const Layer& l, int e, int advice) const {
+        if (l.poff.empty()) {
+            posix_fadvise(pk.fds[(size_t) l.region_file[(size_t) e]], (off_t) l.region_off[(size_t) e],
+                          (off_t) l.region_bytes[(size_t) e], advice);
+            return;
+        }
+        const Layer::XCls& C = xc(l, e);
+        for (int r = 0; r < 3; ++r)
+            for (int q = 0; q < 3; ++q)
+                posix_fadvise(pk.fds[(size_t) l.pfile[(size_t) e][(size_t) (3 * r + q)]],
+                              (off_t) l.poff[(size_t) e][(size_t) (3 * r + q)], (off_t) C.piece_bytes[r][q], advice);
     }
     // host side of the CPU lane, a window's rows
     float *h_x = nullptr, *h_w = nullptr, *h_part = nullptr;
@@ -1708,11 +1758,6 @@ struct Model::Impl {
         }
         // a SAGE pack's layers (each expert matrix its own K: several layouts a layer) keep their experts where the
         // load puts them - no cache swaps, no recent slots (both move experts between slots of one size)
-        if (file_experts && std::any_of(L.begin(), L.end(), [](const Layer& l) { return !l.poff.empty(); })) {
-            err = "this pack keeps its experts' pieces apart in its files (kind by kind), which the engine does not read "
-                  "in place: it needs RAM for the experts VRAM leaves over (more RAM, more GPUs, or --mmap-experts off)";
-            return false;
-        }
         if (std::any_of(L.begin(), L.end(), [](const Layer& l) { return mixed(l); })) {
             if (o.expert_cache || recent_n > 0)
                 std::fprintf(stderr, "ds4: the experts come in several layouts a layer: the expert cache and the recent "
@@ -2125,7 +2170,7 @@ struct Model::Impl {
         }
         // the CPU lane: one pool of workers per NUMA node, each expert split in NH column parts (part X on node X); in
         // place, one part (the files' layout) and one pool over every node's cores (the pages lie where the cache put them)
-        cores = node_cores();
+        cores = node_cores(&node_ids);
         NH = file_experts ? 1 : (int) std::min<size_t>(2, cores.size());
         if (NH > 1 && ((g.ff / NH) % 128 != 0 || (g.dim / NH) % 128 != 0)) NH = 1;
         for (int X = 0; X < (int) cores.size() && X < std::max(NH, 1); ++X) {
@@ -2524,8 +2569,7 @@ struct Model::Impl {
             if (l0.dev == di)
                 for (int i = 0; i < bt.n; ++i) {
                     const int e = l0.host_list[(size_t) (bt.j0 + i)];
-                    posix_fadvise(pk.fds[(size_t) l0.region_file[(size_t) e]], (off_t) l0.region_off[(size_t) e],
-                                  (off_t) l0.region_bytes[(size_t) e], POSIX_FADV_WILLNEED);
+                    advise_region(l0, e, POSIX_FADV_WILLNEED);
                     nb += (double) l0.region_bytes[(size_t) e];
                 }
             issued.push_back({q++, nb});
@@ -3092,9 +3136,12 @@ struct Model::Impl {
             l.hh.assign((size_t) l.n_exp, {nullptr, nullptr, nullptr, nullptr});
             if (file_experts) {   // every expert's file mapped (the cache's swaps hand VRAM experts back to the files)
                 for (int e = 0; e < l.n_exp; ++e)
-                    if (pk.map(l.region_file[(size_t) e]) == nullptr) {
-                        err = "mapping " + pk.files[(size_t) l.region_file[(size_t) e]] + " failed";
-                        return false;
+                    for (int q = 0; q < (l.pfile.empty() ? 1 : 9); ++q) {   // (pieces apart: each piece's file)
+                        const int f = l.pfile.empty() ? l.region_file[(size_t) e] : l.pfile[(size_t) e][(size_t) q];
+                        if (pk.map(f) == nullptr) {
+                            err = "mapping " + pk.files[(size_t) f] + " failed";
+                            return false;
+                        }
                     }
                 for (int e = 0; e < l.n_exp; ++e)
                     if (l.slot[(size_t) e] < 0) {
@@ -3106,7 +3153,7 @@ struct Model::Impl {
                 for (int e = 0; e < l.n_exp; ++e)
                     if (l.slot[(size_t) e] < 0) bytes += xc(l, e).hl.bytes;
                 for (int X = 0; X < NH; ++X) {
-                    void* m = node_map(bytes, X, NH);
+                    void* m = node_map(bytes, node_ids[(size_t) X], NH);
                     if (m == nullptr) {
                         err = "host memory for layer " + std::to_string(l.il) + "'s " + std::to_string(n_host) +
                               " CPU experts (" + std::to_string(bytes >> 20) + " MiB on node " + std::to_string(X) + ")";
@@ -3246,8 +3293,7 @@ struct Model::Impl {
                             break;
                         }
                         if (file_experts)
-                            posix_fadvise(pk.fds[(size_t) l.region_file[(size_t) e]], (off_t) l.region_off[(size_t) e],
-                                          (off_t) l.region_bytes[(size_t) e], POSIX_FADV_DONTNEED);
+                            advise_region(l, e, POSIX_FADV_DONTNEED);
                     } else if (!file_experts) {
                         for (int X = 0; X < NH; ++X) repack_part(l, e, region.data(), X, l.hh[(size_t) e][(size_t) X]);
                     }
@@ -3761,10 +3807,11 @@ struct Model::Impl {
         auto part = [&](int e, int X, int r) {
             const uint8_t* b = l.hh[(size_t) e][(size_t) X];
             const Layer::XCls& C = xc(l, e);
+            const bool apart = file_experts && !l.poff.empty();   // (in place, its pieces apart: each where it lies)
             kc::Exl3Part p;
-            p.trellis = (const uint32_t*) (b + C.hl.trellis[r]);
-            p.suh = (const uint16_t*) (b + C.hl.suh[r]);
-            p.svh = (const uint16_t*) (b + C.hl.svh[r]);
+            p.trellis = (const uint32_t*) (apart ? piece_at(l, e, r, 0) : b + C.hl.trellis[r]);
+            p.suh = (const uint16_t*) (apart ? piece_at(l, e, r, 1) : b + C.hl.suh[r]);
+            p.svh = (const uint16_t*) (apart ? piece_at(l, e, r, 2) : b + C.hl.svh[r]);
             p.k = C.hl.k[r];
             p.n = C.hl.n[r];
             p.K = C.lay.K[r];
