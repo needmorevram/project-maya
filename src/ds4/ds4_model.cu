@@ -429,8 +429,9 @@ struct Geo {
         d_block = (int) p.num("dspark_block_size", 0), d_noise = (int) p.num("dspark_noise_token_id", 0);
         d_rank = (int) p.num("dspark_markov_rank", 0), d_n_exp = (int) p.num("dspark_n_routed_experts", 0);
         d_k = (int) p.num("dspark_num_experts_per_tok", 0), d_targets = p.list("dspark_target_layer_ids");
-        n_mtp = d_block > 0 && (int) ratios.size() > nl && p.get("mtp.0.attn.wq_a.trellis") != nullptr
-                    ? (int) ratios.size() - nl : 0;
+        n_mtp = d_block > 0 && (int) ratios.size() > nl &&
+                        (p.get("mtp.0.attn.wq_a.trellis") != nullptr || p.get("mtp.0.attn.wq_a.weight") != nullptr)
+                    ? (int) ratios.size() - nl : 0;   // (the drafter's blocks EXL3, or the SAGE packs' FP8)
     }
 };
 
@@ -656,6 +657,11 @@ struct Layer {
     std::vector<uint64_t> region_off;           // expert -> file region (offset, bytes, file)
     std::vector<uint64_t> region_bytes;
     std::vector<int> region_file;
+    // a layer whose experts' pieces lie apart (the SAGE packs keep a file's tensors kind by kind, an expert's across
+    // files too): each expert's pieces' files and offsets (part r's piece q at 3 r + q); its region is then the pieces
+    // read one by one and packed in that order (read_region; the classes' piece_src their places there)
+    std::vector<std::array<uint64_t, 9>> poff;
+    std::vector<std::array<int, 9>> pfile;
     size_t dense_bytes = 0;
 };
 
@@ -1452,12 +1458,17 @@ struct Model::Impl {
                         return false;
                     }
                     if (file < 0) file = t->file;
-                    if (t->file != file) {
-                        err = E + ": split across files";
-                        return false;
+                    if (t->file != file && l.poff.empty()) {   // (again, piece by piece)
+                        l.poff.assign((size_t) l.n_exp, {});
+                        l.pfile.assign((size_t) l.n_exp, {});
+                        return expert_layout(l, err);
                     }
                     lo = std::min(lo, t->off);
                     hi = std::max(hi, t->off + t->bytes);
+                    if (!l.poff.empty()) {
+                        l.poff[(size_t) e][(size_t) (3 * r + q)] = t->off;
+                        l.pfile[(size_t) e][(size_t) (3 * r + q)] = t->file;
+                    }
                     if (lead) X.piece_bytes[r][q] = t->bytes;
                     else if (t->bytes != X.piece_bytes[r][q]) {
                         err = E + parts[r] + ": not the shape of its class's first expert";
@@ -1467,16 +1478,44 @@ struct Model::Impl {
             l.region_off[(size_t) e] = lo;
             l.region_bytes[(size_t) e] = hi - lo;
             l.region_file[(size_t) e] = file;
+            if (!l.poff.empty()) {   // (the pieces packed in order: the region read_region puts together)
+                size_t at = 0;
+                for (int r = 0; r < 3; ++r)
+                    for (int q = 0; q < 3; ++q) {
+                        if (lead) X.piece_src[r][q] = at;
+                        at += X.piece_bytes[r][q];
+                    }
+                l.region_bytes[(size_t) e] = at;
+                continue;
+            }
+            size_t pieces_b = 0;
+            for (int r = 0; r < 3; ++r)
+                for (int q = 0; q < 3; ++q) pieces_b += X.piece_bytes[r][q];
+            bool same = true;
             for (int r = 0; r < 3; ++r)
                 for (int q = 0; q < 3; ++q) {
                     const size_t src = pk.get(E + parts[r] + pieces[q])->off - lo;
                     if (lead) X.piece_src[r][q] = src;
-                    else if (src != X.piece_src[r][q]) {
-                        err = E + ": the pieces lie differently from its class's first expert's";
-                        return false;
-                    }
+                    else same = same && src == X.piece_src[r][q];
                 }
+            if (!same || hi - lo > pieces_b + ((uint64_t) 1 << 16)) {   // (its pieces apart: again, piece by piece)
+                l.poff.assign((size_t) l.n_exp, {});
+                l.pfile.assign((size_t) l.n_exp, {});
+                return expert_layout(l, err);
+            }
         }
+        return true;
+    }
+    // expert e's region (its pieces, as piece_src places them) into dst
+    bool read_region(const Layer& l, int e, uint8_t* dst) const {
+        if (l.poff.empty())
+            return pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], l.region_bytes[(size_t) e], dst);
+        const Layer::XCls& C = xc(l, e);
+        for (int r = 0; r < 3; ++r)
+            for (int q = 0; q < 3; ++q)
+                if (!pk.read_at(l.pfile[(size_t) e][(size_t) (3 * r + q)], l.poff[(size_t) e][(size_t) (3 * r + q)],
+                                C.piece_bytes[r][q], dst + C.piece_src[r][q]))
+                    return false;
         return true;
     }
     // a mixed layer's blob header (BlobHdr): the layout lay at the blob's first bytes
@@ -1669,6 +1708,11 @@ struct Model::Impl {
         }
         // a SAGE pack's layers (each expert matrix its own K: several layouts a layer) keep their experts where the
         // load puts them - no cache swaps, no recent slots (both move experts between slots of one size)
+        if (file_experts && std::any_of(L.begin(), L.end(), [](const Layer& l) { return !l.poff.empty(); })) {
+            err = "this pack keeps its experts' pieces apart in its files (kind by kind), which the engine does not read "
+                  "in place: it needs RAM for the experts VRAM leaves over (more RAM, more GPUs, or --mmap-experts off)";
+            return false;
+        }
         if (std::any_of(L.begin(), L.end(), [](const Layer& l) { return mixed(l); })) {
             if (o.expert_cache || recent_n > 0)
                 std::fprintf(stderr, "ds4: the experts come in several layouts a layer: the expert cache and the recent "
@@ -2505,8 +2549,7 @@ struct Model::Impl {
                 std::atomic<bool> bad{false};
                 c.readers->run(bt.n, [&](int i) {
                     const int e = l0.host_list[(size_t) (bt.j0 + i)];
-                    if (!pk.read_at(l0.region_file[(size_t) e], l0.region_off[(size_t) e], l0.region_bytes[(size_t) e],
-                                    sb + (size_t) i * c.stage_stride))
+                    if (!read_region(l0, e, sb + (size_t) i * c.stage_stride))
                         bad.store(true);
                 });
                 if (bad.load()) {
@@ -3176,8 +3219,7 @@ struct Model::Impl {
                     if (i >= jobs.size() || failed.load()) break;
                     const Layer& l = L[(size_t) jobs[i].layer];
                     const int e = jobs[i].e;
-                    if (!pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], l.region_bytes[(size_t) e],
-                                    region.data())) {
+                    if (!read_region(l, e, region.data())) {
                         std::lock_guard<std::mutex> lk(emu);
                         ferr = "reading layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
                         failed.store(true);
@@ -3888,7 +3930,7 @@ struct Model::Impl {
                 for (int pass = 0; pass < (file_experts ? 1 : 2); ++pass) {   // (in place: no host copy of `out`)
                     const int e = pass == 0 ? sw.in : sw.out;
                     reg.resize(l.region_bytes[(size_t) e]);
-                    pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], reg.size(), reg.data());
+                    read_region(l, e, reg.data());
                     if (pass == 0) {
                         repack(l, e, reg.data(), blob.data());
                         std::vector<uint8_t> dev(C.blob);
@@ -4032,7 +4074,7 @@ struct Model::Impl {
                 if (check_swaps) {   // DS4_CHECK_SWAPS: the slot against the model file, byte for byte
                     const Layer::XCls& C = l.cls[0];   // (recent slots: a layer of one layout alone)
                     std::vector<uint8_t> reg(l.region_bytes[(size_t) e]), want(C.blob), dev(C.blob);
-                    pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], reg.size(), reg.data());
+                    read_region(l, e, reg.data());
                     repack(l, e, reg.data(), want.data());
                     if (nm == 1) {
                         cudaSetDevice(devs[(size_t) l.dev].id);
