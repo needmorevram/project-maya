@@ -14,6 +14,7 @@
 
 #include "ds4_kernels.cuh"
 #include "ds4_pool.hpp"
+#include "ds4_uring.hpp"
 #include "ds4_vision.cuh"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -736,6 +737,7 @@ struct Model::Impl {
     std::vector<std::unique_ptr<Worker>> workers;   // threads mode: one per device
     bool par = false;                 // threads mode
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
+    std::atomic<unsigned> win_now{0};   // (the last decode window's win_seq, for the copy threads)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
     int chunk = 0, chunk_min = 512;
     std::vector<std::unique_ptr<Chunk>> chunks;   // per device
@@ -821,6 +823,7 @@ struct Model::Impl {
     // copy streams), switched between windows
     struct Swap {
         int layer = 0, in = -1, out = -1;
+        unsigned win = 0;   // (win_now at the tick that queued it)
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -829,8 +832,10 @@ struct Model::Impl {
     const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f), c_bonus = env_f("DS4_CACHE_BONUS", 1.0f),
                 c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
     const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
-    // the recent slots: DS4_RECENT a trunk layer (0: none), at most DS4_RECENT_FILLS (2) new ones a layer a tick
-    const int recent_n = std::max(0, (int) env_f("DS4_RECENT", 0.0f));
+    // the recent slots: DS4_RECENT a trunk layer (0: none; 32 where the prompts stream the experts by DMA - the serve
+    // protocol at 3.5 bits, 8 / 16 / 24 / 32 of them: 59.0 / 61.5 / 62.2 / 62.9 tok/s, a routing trace's VRAM-neutral
+    // optimum ~32), at most DS4_RECENT_FILLS (2) new ones a layer a tick
+    int recent_n = 0;
     const int recent_fills = std::max(1, (int) env_f("DS4_RECENT_FILLS", 2.0f));
     // a fill once the expert was on the CPU lane DS4_RECENT_NEED (2) times in the layer's last DS4_RECENT_WIN (8)
     // ticks: a one-off pick stays out (a routing trace of 12 answers, 16 slots: 8.9% of picks on the CPU lane for
@@ -844,8 +849,24 @@ struct Model::Impl {
     // in one launch a device (tab_set, from rc_upd: pinned, [2 x kRcUpd])
     struct RcJob {
         int layer = 0, slot = 0, expert = 0;
-        unsigned gen = 0;
+        unsigned gen = 0, win = 0;
     };
+    // the expert cache's copies on a device (the swaps', the fills') off its group's turn in the windows: over the
+    // GPU's PCIe link beside a window's all-reduces they slowed each ~6x (a decode capture's 1405 all-reduces: ~190 us
+    // after the last member's arrival with a copy under way on a member, ~29 without).  A device's turn over: its
+    // last layer of a window (idle_ev, idle_win the window).  The head's group is idle from the tick on (the next
+    // window starts with the first group), so its copies go at once; another group's once its part of a window after
+    // the tick is done.  DS4_COPY_IDLE=0: every copy at once
+    std::vector<cudaEvent_t> idle_ev;
+    std::unique_ptr<std::atomic<unsigned>[]> idle_win;
+    bool copy_open(int di, unsigned w) const {
+        if (idle_ev.empty() || devs[(size_t) di].grp == devs[(size_t) head_dev].grp) return true;
+        const unsigned iw = idle_win[(size_t) di].load(std::memory_order_acquire);
+        return (int) (iw - w) > 0 && (int) (iw - win_now.load(std::memory_order_acquire)) >= 0;
+    }
+    void copy_after_idle(int di, cudaStream_t cs) {   // (di's device current)
+        if (!idle_ev.empty()) cudaStreamWaitEvent(cs, idle_ev[(size_t) di], 0);
+    }
     static constexpr int kRcUpd = 8192;
     std::mutex rc_mu;
     std::condition_variable rc_cv;
@@ -897,6 +918,17 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+        {
+            std::lock_guard<std::mutex> lk(eg_th_mu);
+        }
+        eg_th_cv.notify_all();
+        eg_done_cv.notify_all();
+        if (eg_th.joinable()) eg_th.join();
+        for (auto& f : eg_fd) {
+            if (f.second.first >= 0) ::close(f.second.first);
+            if (f.second.second >= 0) ::close(f.second.second);
+        }
+        std::free(eg_bounce);
         {
             std::lock_guard<std::mutex> lk(sw_mu);
         }
@@ -1310,6 +1342,7 @@ struct Model::Impl {
         chunk = par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : file_experts ? kVlRows : 2048) : 0;
         if (const char* v = std::getenv("DS4_CHUNK")) chunk = par ? std::atoi(v) : 0;
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
+        recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && !file_experts ? 32.0f : 0.0f));
         if (chunk > 0) {
             chunk = std::min(kVlRows, std::max(256, chunk / 16 * 16));   // (route()'s image bits cover a chunk)
             eg_cap = (size_t) chunk;
@@ -1829,6 +1862,15 @@ struct Model::Impl {
                 if (core >= 0) pin_self(core);
                 serve_lane();
             });
+        }
+        if (par && (!std::getenv("DS4_COPY_IDLE") || std::atoi(std::getenv("DS4_COPY_IDLE")) != 0)) {
+            idle_ev.assign(devs.size(), nullptr);
+            idle_win.reset(new std::atomic<unsigned>[devs.size()]);
+            for (size_t di = 0; di < devs.size(); ++di) {
+                cudaSetDevice(devs[di].id);
+                CK(cudaEventCreateWithFlags(&idle_ev[di], cudaEventDisableTiming));
+                idle_win[di].store(0u);
+            }
         }
         if (o.expert_cache) {
             size_t maxb = 0;
@@ -3063,7 +3105,71 @@ struct Model::Impl {
         }
     }
     std::mutex eg_mu;   // (the decode's windows read Engram rows on the last pool, one at a time)
-    void engram_rows(int64_t p0, int T, int only = -1, uint8_t* dst = nullptr, Pool* pool = nullptr) {
+    // a decode window's (threads mode): its rows all in flight at once (io_uring) from a thread of their own, while the
+    // window's first layers run - a device waits only before its Engram layer (eg_win: the window whose rows are in
+    // h_eg).  Before, the last CPU-lane pool's threads read them in pread, ~22 deep: ~0.44 ms of the host's a token
+    // before every window (and the same reads on an IO pool during the window slowed the CPU lane by a fifth).
+    // DS4_EG_URING=1 (opt-in: in the CLI's decode it was slower than the pool's reads, and the serve bench's A/B is
+    // still to run)
+    std::thread eg_th;
+    std::mutex eg_th_mu;
+    std::condition_variable eg_th_cv, eg_done_cv;
+    struct EgJob {
+        int64_t p0 = 0;
+        int T = 0;
+        unsigned win = 0;
+    };
+    std::deque<EgJob> eg_jobs;
+    std::atomic<unsigned> eg_win[2] = {};   // (a table's: layer 1's are read first)
+    Uring eg_ring;
+    bool eg_ring_tried = false;
+    bool eg_async() const { return par && eg_ring.ok() && pk.eg_layers > 0 && pk.eg_layers <= 2; }
+    // the tables' files opened again for these reads: the rows by O_DIRECT (each read once, never again: they
+    // stay out of the page cache), the scales buffered with FADV_RANDOM (no readahead) - so the page cache keeps
+    // the scales (8 bytes a row, a 3 GB table a layer: half the reads; the NVMe here does ~150K of these a second)
+    std::unordered_map<int, std::pair<int, int>> eg_fd;   // file -> (buffered, O_DIRECT; -1: none)
+    uint8_t* eg_bounce = nullptr;   // (the O_DIRECT reads' aligned buffers, 1 KB a read)
+    size_t eg_bounce_n = 0;
+    void eg_open() {
+        for (int li = 0; li < pk.eg_layers; ++li) {
+            const std::string P = "layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.";
+            for (const char* w : {"weight", "scale"}) {
+                const Tensor* t = pk.get(P + w);
+                if (t == nullptr || eg_fd.count(t->file)) continue;
+                const std::string path = pk.model_dir + "/" + pk.files[(size_t) t->file];
+                const int b = ::open(path.c_str(), O_RDONLY), dd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+                if (b >= 0) posix_fadvise(b, 0, 0, POSIX_FADV_RANDOM);
+                eg_fd[t->file] = {b, dd};
+            }
+        }
+    }
+    void eg_loop() {
+        const size_t per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
+        for (;;) {
+            EgJob j;
+            {
+                std::unique_lock<std::mutex> lk(eg_th_mu);
+                eg_th_cv.wait(lk, [&] { return quit.load() || !eg_jobs.empty(); });
+                if (quit.load()) return;
+                j = eg_jobs.front();
+                eg_jobs.pop_front();
+            }
+            for (int li = 0; li < pk.eg_layers; ++li) {
+                engram_rows(j.p0, j.T, li, h_eg + (size_t) li * eg_cap * per, nullptr, &eg_ring);
+                {
+                    std::lock_guard<std::mutex> lk(eg_th_mu);
+                    eg_win[li].store(j.win, std::memory_order_release);
+                }
+                eg_done_cv.notify_all();
+            }
+        }
+    }
+    void eg_wait(int li, unsigned win) {
+        if (eg_win[li].load(std::memory_order_acquire) == win) return;
+        std::unique_lock<std::mutex> lk(eg_th_mu);
+        eg_done_cv.wait(lk, [&] { return quit.load() || eg_win[li].load(std::memory_order_acquire) == win; });
+    }
+    void engram_rows(int64_t p0, int T, int only = -1, uint8_t* dst = nullptr, Pool* pool = nullptr, Uring* ring = nullptr) {
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads, hd = pk.eg_hd;
         const size_t per = (size_t) cols * (hd + hd / 32);
         struct Read {
@@ -3111,6 +3217,34 @@ struct Model::Impl {
             const Read& r = reads[(size_t) i];
             pk.read_at(r.t->file, r.off, r.n, r.dst);
         };
+        if (ring != nullptr) {
+            if (eg_bounce_n < reads.size()) {
+                std::free(eg_bounce);
+                eg_bounce_n = reads.size() * 2;
+                eg_bounce = (uint8_t*) std::aligned_alloc(4096, eg_bounce_n * 1024);
+            }
+            std::vector<UringRead> ur(reads.size());
+            std::vector<uint32_t> skip(reads.size(), ~0u);   // (an O_DIRECT read: the row's offset in its sectors)
+            for (size_t i = 0; i < reads.size(); ++i) {
+                const Read& r = reads[i];
+                const auto f = eg_fd.find(r.t->file);
+                const int b = f != eg_fd.end() && f->second.first >= 0 ? f->second.first : pk.fds[(size_t) r.t->file];
+                const int dd = f != eg_fd.end() ? f->second.second : -1;
+                const uint64_t a0 = r.off / 512 * 512, a1 = (r.off + r.n + 511) / 512 * 512;
+                if (dd >= 0 && eg_bounce != nullptr && r.n >= 64 && a1 - a0 <= 1024) {
+                    ur[i] = {dd, a0, (uint32_t) (a1 - a0), eg_bounce + i * 1024};
+                    skip[i] = (uint32_t) (r.off - a0);
+                } else
+                    ur[i] = {b, r.off, r.n, r.dst};
+            }
+            if (ring->read_all(ur)) {
+                for (size_t i = 0; i < reads.size(); ++i)
+                    if (skip[i] != ~0u) std::memcpy(reads[i].dst, eg_bounce + i * 1024 + skip[i], reads[i].n);
+                return;
+            }
+            for (size_t i = 0; i < reads.size(); ++i) one((int) i);   // (the ring failed: pread, here)
+            return;
+        }
         if (pool != nullptr) {
             pool->run((int) reads.size(), one);
             return;
@@ -3301,10 +3435,19 @@ struct Model::Impl {
             }
             Layer& l = L[(size_t) sw.layer];
             parts_to_blob(l, l.hh[(size_t) sw.in], B.a);
+            auto off_turn = [&](int di, cudaStream_t cs) {   // (false: quitting)
+                while (!copy_open(di, sw.win)) {
+                    if (quit.load()) return false;
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+                copy_after_idle(di, cs);
+                return true;
+            };
             if (l.nm == 1) {
                 const Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
                 cudaStream_t cs = B.st[(size_t) l.dev];
+                if (!off_turn(l.dev, cs)) return;
                 cudaMemcpyAsync(l.vram_base + (size_t) l.spare_vram * l.blob, B.a, l.blob, cudaMemcpyHostToDevice, cs);
                 if (!file_experts)
                     cudaMemcpyAsync(B.b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob,
@@ -3316,9 +3459,11 @@ struct Model::Impl {
                     cudaSetDevice(devs[(size_t) x.dev].id);
                     cudaStream_t cs = B.st[(size_t) x.dev];
                     blob_to_half(l, B.a, m, B.h);
+                    if (!off_turn(x.dev, cs)) return;
                     cudaMemcpyAsync(x.vram_base + (size_t) l.spare_vram * x.hblob, B.h, x.hblob, cudaMemcpyHostToDevice, cs);
                     cudaStreamSynchronize(cs);
                     if (file_experts) continue;
+                    if (!off_turn(x.dev, cs)) return;
                     cudaMemcpyAsync(B.h, x.vram_base + (size_t) l.slot[(size_t) sw.out] * x.hblob, x.hblob,
                                     cudaMemcpyDeviceToHost, cs);
                     cudaStreamSynchronize(cs);
@@ -3372,27 +3517,37 @@ struct Model::Impl {
     }
 
     void rc_loop() {
-        std::vector<RcJob> fly;   // issued, not yet done
+        std::vector<RcJob> fly;     // issued, not yet done
+        std::deque<RcJob> held;     // waiting for their group's turn to end (copy_open)
         std::string err;
         for (;;) {
-            std::deque<RcJob> got;
             {
                 std::unique_lock<std::mutex> lk(rc_mu);
-                if (fly.empty()) rc_cv.wait(lk, [&] { return quit.load() || !rc_q.empty(); });
+                if (fly.empty() && held.empty()) rc_cv.wait(lk, [&] { return quit.load() || !rc_q.empty(); });
                 if (quit.load()) return;
-                got.swap(rc_q);
+                for (const RcJob& j : rc_q) held.push_back(j);
+                rc_q.clear();
             }
-            for (const RcJob& j : got) {
+            for (size_t i = 0; i < held.size();) {
+                const RcJob j = held[i];
                 Layer& l = L[(size_t) j.layer];
+                bool open = true;   // (a layer's members are one group's)
+                for (int m = 0; m < l.nm && open; ++m) open = copy_open(member(l, m).dev, j.win);
+                if (!open) {
+                    ++i;
+                    continue;
+                }
                 for (int m = 0; m < l.nm; ++m) {
                     Layer& x = member(l, m);
                     const int di = x.dev;
                     cudaSetDevice(devs[(size_t) di].id);
                     cudaStreamWaitEvent(rc_cs[(size_t) di], rc_go[(size_t) di], 0);   // (after the tick's tables)
+                    copy_after_idle(di, rc_cs[(size_t) di]);
                     stream_expert(l, m, j.expert, x.vram_base + (size_t) (l.rc_base + j.slot) * unit(x), rc_cs[(size_t) di], err);
                     cudaEventRecord(l.rc_ev[(size_t) j.slot * l.nm + m], rc_cs[(size_t) di]);
                 }
                 fly.push_back(j);
+                held.erase(held.begin() + (std::ptrdiff_t) i);
             }
             for (size_t i = 0; i < fly.size();) {   // the ones whose copies are all done: marked
                 const RcJob& j = fly[i];
@@ -3409,7 +3564,7 @@ struct Model::Impl {
                 } else
                     ++i;
             }
-            if (!fly.empty()) std::this_thread::sleep_for(std::chrono::microseconds(200));
+            if (!fly.empty() || !held.empty()) std::this_thread::sleep_for(std::chrono::microseconds(held.empty() ? 200 : 50));
         }
     }
 
@@ -3425,15 +3580,11 @@ struct Model::Impl {
             }
         } tm{this, t_tick};
         if (rc_cs.empty()) {
+            if (!tab_bufs()) return;
             rc_cs.assign(devs.size(), nullptr);
-            rc_go.assign(devs.size(), nullptr);
-            rc_upd.assign(devs.size(), nullptr);
-            std::string e0;
             for (size_t di = 0; di < devs.size(); ++di) {
                 cudaSetDevice(devs[di].id);
                 cudaStreamCreateWithFlags(&rc_cs[di], cudaStreamNonBlocking);
-                cudaEventCreateWithFlags(&rc_go[di], cudaEventDisableTiming);
-                if (!hmap(rc_upd[di], (size_t) 2 * kRcUpd, e0)) return;
             }
             int off = 0;
             for (Layer& l : L) {
@@ -3445,8 +3596,8 @@ struct Model::Impl {
             rc_th = std::thread([this] { rc_loop(); });
         }
         const unsigned now = rc_clock.fetch_add(1, std::memory_order_relaxed) + 1;
-        std::vector<std::vector<unsigned long long>> upd(devs.size());   // [device]: (entry, value) pairs
-        std::vector<RcJob> jobs;
+        std::vector<std::vector<unsigned long long>>& upd = tick_upd;
+        std::vector<RcJob>& jobs = tick_jobs;
         for (Layer& l : L) {
             if (l.rc_n == 0) continue;
             const int nm = l.nm;
@@ -3524,14 +3675,40 @@ struct Model::Impl {
                 }
                 l.rc_fill[(size_t) v] = e;
                 l.rc_gen[(size_t) v] = now;
-                jobs.push_back({l.il, v, e, now});
+                jobs.push_back({l.il, v, e, now, win_now.load(std::memory_order_relaxed)});
                 ++started;
                 ++rc_fills_started;
             }
         }
-        // the table entries: one launch a device, before the next window; then rc_go there (the fills after it)
+    }
+
+    // a tick's table entries (the recent slots', the swaps'): one launch a device, before the next window; then rc_go
+    // there (the fills after it).  (A copy of each entry on its own was ~10 us of the host's, 48 of them 0.5 ms between
+    // two windows)
+    std::vector<std::vector<unsigned long long>> tick_upd;   // [device]: (entry, value) pairs
+    std::vector<RcJob> tick_jobs;
+    bool tab_bufs() {
+        if (!rc_upd.empty()) return true;
+        std::string e0;
+        rc_go.assign(devs.size(), nullptr);
+        rc_upd.assign(devs.size(), nullptr);
         for (size_t di = 0; di < devs.size(); ++di) {
-            const std::vector<unsigned long long>& u = upd[di];
+            cudaSetDevice(devs[di].id);
+            cudaEventCreateWithFlags(&rc_go[di], cudaEventDisableTiming);
+            if (!hmap(rc_upd[di], (size_t) 2 * kRcUpd, e0)) {
+                rc_upd.clear();
+                return false;
+            }
+        }
+        return true;
+    }
+    void tick_flush() {
+        const std::vector<RcJob>& jobs = tick_jobs;
+        bool any = !jobs.empty();
+        for (const auto& u : tick_upd) any = any || !u.empty();
+        if (!any || !tab_bufs()) return;
+        for (size_t di = 0; di < devs.size(); ++di) {
+            const std::vector<unsigned long long>& u = tick_upd[di];
             if (u.empty() && jobs.empty()) continue;
             cudaSetDevice(devs[di].id);
             const int n = (int) std::min<size_t>(u.size() / 2, (size_t) kRcUpd);
@@ -3551,7 +3728,14 @@ struct Model::Impl {
     }
 
     void cache_tick(int T) {
+        tick_upd.resize(devs.size());
+        for (auto& u : tick_upd) u.clear();
+        tick_jobs.clear();
         rc_tick();
+        swap_tick(T);
+        tick_flush();
+    }
+    void swap_tick(int T) {
         if (!o.expert_cache || cache_ths.empty()) return;
         std::vector<Swap> ready;
         {
@@ -3576,14 +3760,13 @@ struct Model::Impl {
                 l.spare_host = old_parts;
             }
             l.spare_vram = old_slot;
-            for (int m = 0; m < l.nm; ++m) {
+            for (int m = 0; m < l.nm; ++m) {   // (tick_flush: stream order, before the next window)
                 Layer& x = member(l, m);
-                const Dev& dm = devs[(size_t) x.dev];
-                l.tab_pin[2 * m] = (unsigned long long) (x.vram_base + (size_t) l.slot[(size_t) sw.in] * unit(x));
-                l.tab_pin[2 * m + 1] = 0ull;
-                cudaSetDevice(dm.id);   // (stream order: before the next window)
-                cudaMemcpyAsync(x.vram_tab + sw.in, &l.tab_pin[2 * m], 8, cudaMemcpyHostToDevice, dm.st);
-                cudaMemcpyAsync(x.vram_tab + sw.out, &l.tab_pin[2 * m + 1], 8, cudaMemcpyHostToDevice, dm.st);
+                std::vector<unsigned long long>& u = tick_upd[(size_t) x.dev];
+                u.push_back((unsigned long long) (x.vram_tab + sw.in));
+                u.push_back((unsigned long long) (x.vram_base + (size_t) l.slot[(size_t) sw.in] * unit(x)));
+                u.push_back((unsigned long long) (x.vram_tab + sw.out));
+                u.push_back(0ull);
             }
             l.swap_pending = false;
             l.sw_in = -1;
@@ -3619,7 +3802,7 @@ struct Model::Impl {
             l.sw_in = best;
             ++sw_inflight;
             std::lock_guard<std::mutex> lk(sw_mu);
-            sw_queue.push_back({l.il, best, cold});
+            sw_queue.push_back({l.il, best, cold, win_now.load(std::memory_order_relaxed)});
             queued = true;
         }
         if (queued) sw_cv.notify_all();
@@ -4041,18 +4224,35 @@ struct Model::Impl {
                 cudaSetDevice(devs[di].id);
                 ring_restore_batch(rb[di], p0, g.win, keep, T, g.hd, devs[di].st);
             }
+        // the compressors' state: the same, one launch a device (two copies and a launch a layer and member were
+        // ~0.3 ms of the host's before the next draft)
+        std::vector<CompBatch> cb(devs.size());
         for (int il = 0; il < g.nl; ++il)
             for (int m = 0; m < L[(size_t) il].nm; ++m) {
                 Layer& l = member(L[(size_t) il], m);
                 Dev& d = devs[(size_t) l.dev];
-                if (l.c_snap != nullptr) {
+                if (l.c_snap == nullptr) continue;
+                CompBatch& b = cb[(size_t) l.dev];
+                if (b.n == kMaxRingBatch) {   // (more than a batch takes: this one alone)
                     cudaSetDevice(d.id);
                     const size_t ns = (size_t) l.ratio * g.hd * 4;
                     cudaMemcpyAsync(l.c_kv, l.c_snap, ns, cudaMemcpyDeviceToDevice, d.st);
                     cudaMemcpyAsync(l.c_score, l.c_snap + (size_t) l.ratio * g.hd, ns, cudaMemcpyDeviceToDevice, d.st);
                     compress_win(l.c_rows, l.c_rows + (size_t) kWin * g.hd, l.c_kv, l.c_score, l.ratio, (int) p0, keep,
                                  g.hd, l.c_norm, g.eps, d.latent, d.st);
+                    continue;
                 }
+                b.kv_state[b.n] = l.c_kv;
+                b.score_state[b.n] = l.c_score;
+                b.snap[b.n] = l.c_snap;
+                b.kv[b.n] = l.c_rows;
+                b.score[b.n] = l.c_rows + (size_t) kWin * g.hd;
+                b.ratio[b.n++] = l.ratio;
+            }
+        for (size_t di = 0; di < devs.size(); ++di)
+            if (cb[di].n > 0) {
+                cudaSetDevice(devs[di].id);
+                comp_restore_batch(cb[di], p0, keep, g.hd, devs[di].st);
             }
         pos = p0 + keep;
         toks.resize((size_t) pos);
@@ -4859,9 +5059,25 @@ struct Model::Impl {
             toks.push_back(tk[t]);
             ctoks.push_back(ctok(pos + t, tk[t]));
         }
-        const double te = now_ms();
-        if (pk.eg_layers > 0) engram_rows(p0, T);
-        st.engram_ms += now_ms() - te;
+        if (!eg_ring_tried && par && pk.eg_layers > 0) {
+            eg_ring_tried = true;
+            if (std::getenv("DS4_EG_URING") && std::atoi(std::getenv("DS4_EG_URING")) != 0) {
+                eg_ring.init(512);
+                if (eg_ring.ok()) eg_open();
+            }
+        }
+        if (eg_async()) {   // (forward_par's window: win_seq + 1)
+            if (!eg_th.joinable()) eg_th = std::thread([this] { eg_loop(); });
+            {
+                std::lock_guard<std::mutex> lk(eg_th_mu);
+                eg_jobs.push_back({p0, T, win_seq + 1});
+            }
+            eg_th_cv.notify_one();
+        } else {
+            const double te = now_ms();
+            if (pk.eg_layers > 0) engram_rows(p0, T);
+            st.engram_ms += now_ms() - te;
+        }
         const int D = g.dim;
         for (int t = 0; t < T; ++t)   // (h_emb is written again by the next window, after this one's last sync)
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
@@ -4944,6 +5160,7 @@ struct Model::Impl {
     // devices waiting on each other through host-mapped flags (the window's seq)
     bool forward_par(int64_t p0, int T, std::string& err) {
         wplan.win = ++win_seq;
+        win_now.store(wplan.win, std::memory_order_release);
         std::vector<std::string> errs(devs.size());
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, p0, T, &errs] {
@@ -5028,7 +5245,11 @@ struct Model::Impl {
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
             if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
         }
-        if (d.grp == devs[(size_t) head_dev].grp) return head_rows_dev(di, T, err);
+        if (d.grp == devs[(size_t) head_dev].grp && !head_rows_dev(di, T, err)) return false;
+        if (!idle_ev.empty()) {   // (its turn over: the expert cache's copies from here, copy_open)
+            CK(cudaEventRecord(idle_ev[(size_t) di], s));
+            idle_win[(size_t) di].store(wp.win, std::memory_order_release);
+        }
         return true;
     }
 
@@ -5069,6 +5290,11 @@ struct Model::Impl {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
             uint8_t* src = h_eg + (size_t) l.eg * eg_cap * per;
+            if (wp.par && eg_async() && eg_win[l.eg].load(std::memory_order_acquire) != wp.win) {
+                const double te = now_ms();
+                eg_wait(l.eg, wp.win);
+                if (mi == 0) st.engram_ms += now_ms() - te;
+            }
             for (int t = 0; t < T; ++t)   // [token][rows | scales] -> [all rows][all scales]
                 CK(cudaMemcpyAsync(d.eg_rows + (size_t) t * cols * ehd, src + (size_t) t * per, (size_t) cols * ehd,
                                    cudaMemcpyHostToDevice, s));

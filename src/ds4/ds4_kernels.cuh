@@ -147,6 +147,19 @@ struct RingBatch {
     int n = 0;
 };
 void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
+/// The compressors' state back to a window's first `keep` positions, up to kMaxRingBatch layers at once: each layer's
+/// snapshot (ratio x d kv, then ratio x d scores: the state before the window), then the kept rows (kv[t], score[t],
+/// t < keep) at their slots (p0 + t) % ratio - compress_win's state over the snapshot, its pools' latent rows left out.
+struct CompBatch {
+    float* kv_state[kMaxRingBatch] = {};
+    float* score_state[kMaxRingBatch] = {};
+    const float* snap[kMaxRingBatch] = {};
+    const float* kv[kMaxRingBatch] = {};
+    const float* score[kMaxRingBatch] = {};
+    int ratio[kMaxRingBatch] = {};
+    int n = 0;
+};
+void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s);
 
 /// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].
 void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s);

@@ -1016,6 +1016,21 @@ __global__ void ring_restore_batch_kernel(const RingBatch b, long long p0, int n
     for (int e = threadIdx.x; e < d; e += blockDim.x) row[e] = src[e];
 }
 
+__global__ void comp_restore_batch_kernel(const CompBatch b, long long p0, int keep, int d) {
+    const int li = blockIdx.x, R = b.ratio[li];
+    for (int i = threadIdx.x; i < R * d; i += blockDim.x) {
+        const int slot = i / d, e = i % d;
+        float kv = b.snap[li][i], sc = b.snap[li][(size_t) R * d + i];   // (the last kept row at the slot, else the snapshot)
+        for (int t = 0; t < keep; ++t)
+            if ((int) ((p0 + t) % R) == slot) {
+                kv = b.kv[li][(size_t) t * d + e];
+                sc = b.score[li][(size_t) t * d + e];
+            }
+        b.kv_state[li][i] = kv;
+        b.score_state[li][i] = sc;
+    }
+}
+
 __global__ void hc_mean_kernel(const float* __restrict__ h, int hc, int dim, float* __restrict__ out,
                                long long out_stride) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
@@ -1878,6 +1893,9 @@ void ring_restore(uint16_t* ring, const uint16_t* backup, int64_t p0, int n, int
 void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
     if (T > keep && b.n > 0)
         ring_restore_batch_kernel<<<dim3(T - keep, b.n), kThreads, 0, s>>>(b, (long long) p0, n, keep, d);
+}
+void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s) {
+    if (b.n > 0) comp_restore_batch_kernel<<<b.n, kThreads, 0, s>>>(b, (long long) p0, keep, d);
 }
 void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
     hc_mean_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(h, hc, dim, out, out_stride);
