@@ -39,8 +39,13 @@ struct Options {
     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
-    // -1: 2048, or 8192 with the experts read in place (every chunk streams them all from the files)
+    // -1: 4096, or 8192 with the experts read in place (every chunk streams them all from the files)
     int prefill_chunk = -1;
+    // a long prompt's consumer layers (YOCO: from the first layer of compress ratio 1 on, whose long-range KV and index
+    // keys are that layer's own, made from its input) over only the run's tail: 0 the exact tail, (window - 1) x the
+    // consumer layers + window rows - the state and the logits as with every row; N > 0 the last N rows (at least a
+    // window), their windows cut at the tail's start (DeepInfer's bounded replay: approximate); -1 every row
+    int prefill_keep = 0;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;
@@ -87,9 +92,12 @@ public:
 
     /// The DSpark drafter (speculative decoding): its block size (0: not loaded), drafts for the positions after `y`
     /// (y: the token at pos(), not fed yet) with their confidences, and the verification of [y, drafts]: how many of the
-    /// drafts stand and the token after them (the state then holds y and the accepted drafts).
+    /// drafts stand and the token after them (the state then holds y and the accepted drafts).  A sampled request
+    /// (temperature > 0) draws its drafts through its own chain (counter: the draw index of the token after y - the
+    /// same the verification gets) and verifies them by speculative sampling: the tokens distributed as plain draws.
     int draft_block() const;
-    bool draft(int y, std::vector<int>& drafts, std::vector<float>& conf, std::string& err);
+    bool draft(int y, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
+               std::vector<int>& drafts, std::vector<float>& conf, std::string& err);
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
 
@@ -121,6 +129,11 @@ public:
     /// the image bias, and take no part in the Engram n-grams); the rest the embedding table's.
     void set_images(std::vector<Image> images);
 
+    /// Options::prefill_keep from now on (tests: one load, several settings)
+    void set_prefill_keep(int keep);
+    /// A sampled request's drafts: drawn from the drafter's distribution (1), its argmax (0), the default (-1: the
+    /// argmax, DS4_DRAFT_SAMPLE=1 drawn)
+    void set_draft_sample(int on);
     void save_profile() const;
     const Stats& stats() const;
     Tiers tiers() const;
