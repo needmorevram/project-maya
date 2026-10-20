@@ -6,9 +6,10 @@ driver keeps outside every process (its reserve), that is "CUDA and the rest".""
 from __future__ import annotations
 
 # the VRAM line's byte counts (Glm5Model::VramReport, src/program/generate.cpp; strata-ds4's info_lines, whose vision
-# tower runs in the engine's own process: vision_own)
+# tower runs in the engine's own process: vision_own, and which also tells its prompt chunks' buffers apart (prompt)
+# and what its tensor parallel copies (tp, of a group of tp_n GPUs - out of its weights and kv))
 BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window", "pool", "tail", "borrow", "vision",
-         "vision_own")
+         "vision_own", "prompt", "tp")
 
 
 def parse(line: str) -> dict | None:
@@ -63,9 +64,9 @@ def merge(lines: list[dict]) -> list[dict]:
 def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, vision_pid: int | None = None,
          vision_lent: bool = False) -> list[dict]:
     """Each GPU the engine reports, as the Monitor draws it: its NVML number and name, the total, and the bytes of each
-    part - the engine's (weights, kv, act, drafter + window, pool), the vision encoder's, the CUDA context and the rest,
-    other programs, free.  `cards`: the telemetry's per-card readings ([] without NVML: the start's measurement only);
-    `vision_lent`: the on-demand encoder has the first GPU's pool tail now (the engine freed it)."""
+    part - the engine's (weights, kv, act, prompt, tp, drafter + window, pool), the vision encoder's, the CUDA context
+    and the rest, other programs, free.  `cards`: the telemetry's per-card readings ([] without NVML: the start's
+    measurement only); `vision_lent`: the on-demand encoder has the first GPU's pool tail now (the engine freed it)."""
     cards = cards or []
     by_pci = {c.get("pci"): c for c in cards if c.get("pci")}
     out = []
@@ -77,6 +78,7 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, v
         lent = bool(vision_lent and r.get("vision") and r["dev"] == 0)
         pool = max(0, r.get("pool", 0) - (r.get("tail", 0) if lent else 0))
         parts = {"weights": r.get("weights", 0), "kv": r.get("kv", 0), "act": r.get("act", 0),
+                 "prompt": r.get("prompt", 0), "tp": r.get("tp", 0),
                  "drafter": r.get("drafter", 0) + r.get("window", 0), "pool": pool}
         engine = sum(parts.values())
         own, enc = procs.get(engine_pid), procs.get(vision_pid) if vision_pid else None
@@ -107,5 +109,6 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, v
                     "borrow": r.get("borrow", 0), "lendable": r.get("vision", 0), "vision_lent": lent,
                     "vision_own": inside,
                     "slots": r.get("slots", 0), "layers": r.get("layers"), "ctx": r.get("ctx", 0),
+                    "tp_n": r.get("tp_n", 0),
                     "kv_ram": r.get("kv_ram", 0), "measured": "nvml" if own is not None else "start"})
     return out

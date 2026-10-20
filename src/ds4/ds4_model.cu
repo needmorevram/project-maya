@@ -446,6 +446,9 @@ struct Dev {
     cudaStream_t st2 = nullptr;
     cudaEvent_t hc_go = nullptr, hc_done = nullptr;
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
+    // (the Monitor's map: the prompt chunks' buffers, out of scratch; of the weights, the copies a group's members
+    // each hold of the tensors they do not split - what tensor parallel costs beyond one copy, its members' share)
+    size_t prompt = 0, tp_w = 0;
     std::vector<void*> allocs;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
     float *h = nullptr, *h2 = nullptr, *x = nullptr, *qr = nullptr, *q = nullptr, *kvr = nullptr, *ckr = nullptr,
@@ -2008,6 +2011,7 @@ struct Model::Impl {
         for (size_t di = 0; di < devs.size(); ++di) {
             Dev& d = devs[di];
             cudaSetDevice(d.id);
+            const size_t s0 = d.scratch;   // (this device's chunk buffers: d.prompt, not d.scratch)
             chunks[di] = std::make_unique<Chunk>();
             Chunk& c = *chunks[di];
             const int nm = (int) groups[(size_t) d.grp].mem.size();
@@ -2088,6 +2092,8 @@ struct Model::Impl {
             CK(cudaEventCreateWithFlags(&c.ar_go, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&c.ar_done, cudaEventDisableTiming));
             for (cudaEvent_t& e : c.pend_ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            d.prompt += d.scratch - s0;
+            d.scratch = s0;
         }
         // the prompt's Engram rows: the shared slots, the reader's IO pool (DS4_EG_READERS, 48), the devices that copy
         eg_copies = 0;
@@ -2363,10 +2369,13 @@ struct Model::Impl {
             const int nm = l0.nm, na = g.heads / std::max(1, l.ahn), ha = l.ah0 / std::max(1, l.ahn);
             const std::string& P = l.name;
             const std::string A = P + "attn.";
+            // (the member's shares in sp; what d.weights gains besides them every member holds whole: tp_w)
+            const size_t w0 = d.weights;
+            size_t sp = 0;
             bool ok = mat(d, A + "wq_a", l.wq_a, err, acct) &&
-                      (l.ahn == 0 || mat(d, A + "wq_b", l.wq_b, err, acct, ha, na, true)) &&
+                      (l.ahn == 0 || mat(d, A + "wq_b", l.wq_b, err, &sp, ha, na, true)) &&
                       mat(d, A + "wkv", l.wkv, err, acct) &&
-                      (l.ahn == 0 || mat(d, A + "wo_b", l.wo_b, err, acct, ha, na, false)) &&
+                      (l.ahn == 0 || mat(d, A + "wo_b", l.wo_b, err, &sp, ha, na, false)) &&
                       f32(d, A + "q_norm.weight", l.q_norm, err, acct, (size_t) g.q_lora) &&
                       f32(d, A + "kv_norm.weight", l.kv_norm, err, acct, (size_t) g.hd) &&
                       f32(d, A + "attn_sink", l.sink, err, acct, (size_t) g.heads) &&
@@ -2380,13 +2389,13 @@ struct Model::Impl {
                       f32(d, P + "ffn.gate.bias", l.gate_bias, err, acct, (size_t) l.n_exp) &&
                       (l.mtp || img_tok < 0 || pk.get(P + "ffn.gate.bias_vl") == nullptr ||
                        f32(d, P + "ffn.gate.bias_vl", l.gate_bias_vl, err, acct, (size_t) l.n_exp)) &&
-                      mat(d, P + "ffn.shared_experts.w1", l.s1, err, acct, mi, nm, true, l.il % nm) &&
-                      mat(d, P + "ffn.shared_experts.w2", l.s2, err, acct, mi, nm, false, l.il % nm) &&
-                      mat(d, P + "ffn.shared_experts.w3", l.s3, err, acct, mi, nm, true, l.il % nm);
+                      mat(d, P + "ffn.shared_experts.w1", l.s1, err, &sp, mi, nm, true, l.il % nm) &&
+                      mat(d, P + "ffn.shared_experts.w2", l.s2, err, &sp, mi, nm, false, l.il % nm) &&
+                      mat(d, P + "ffn.shared_experts.w3", l.s3, err, &sp, mi, nm, true, l.il % nm);
             if (!ok) return false;
             l.sink += (size_t) l.ah0;
             for (int gi = 0; gi < l.ogn; ++gi)
-                if (!mat(d, A + "wo_a.slice." + std::to_string(l.og0 + gi), l.wo_a[gi], err, acct)) return false;
+                if (!mat(d, A + "wo_a.slice." + std::to_string(l.og0 + gi), l.wo_a[gi], err, &sp)) return false;
             if (l.kv_src) {
                 const std::string C = A + "compressor.";
                 if (!mat(d, C + "wkv", l.c_wkv, err, acct) || !f32(d, C + "norm.weight", l.c_norm, err, acct)) return false;
@@ -2422,6 +2431,8 @@ struct Model::Impl {
                     return false;
             }
             if (!dalloc(d, l.vram_tab, (size_t) l.n_exp, err, acct)) return false;
+            if (nm > 1) d.tp_w += (d.weights - w0) / (size_t) nm * (size_t) (nm - 1);
+            d.weights += sp;
           }
         if (d.grp == devs[(size_t) head_dev].grp) {   // the head: each member of its group a share of the columns
             const int hn = head_nm();
@@ -6065,7 +6076,10 @@ struct Model::Impl {
         // the Monitor's map of each GPU (serve/gpu_map.py, the GLM engine's VRAM lines): what each part holds on the
         // card, in bytes - the dense weights (the drafter's blocks apart), the KV caches, the window's buffers, the
         // drafter's blocks (their weights, a share estimated, and experts), the routed experts' slots, the vision
-        // tower (in this process: vision_own)
+        // tower (in this process: vision_own); the prompt chunks' buffers (prompt); and tensor parallel's copies (tp,
+        // out of weights and kv): of a group of tp_n, each member's (tp_n - 1) / tp_n of the tensors every member holds
+        // whole and of its KV caches (every member has its layers' whole KV) - the drafter's few caches on the first
+        // GPU at --tp 9 counted with them
         for (const Dev& d : devs) {
             size_t fr = 0, tot = 0;
             cudaSetDevice(d.id);
@@ -6088,14 +6102,17 @@ struct Model::Impl {
                 }
             mtp_dense = std::min(mtp_dense, d.weights);
             mtp_exp = std::min(mtp_exp, d.experts);
+            const size_t tn = groups[(size_t) d.grp].mem.size();
+            const size_t tp_w = std::min(d.tp_w, d.weights - mtp_dense), tp_kv = tn > 1 ? d.caches / tn * (tn - 1) : 0;
             const size_t vis = img_tok >= 0 && vt.device() == d.id ? vt.device_bytes() : 0;
             char pci[32] = "-";
             if (cudaDeviceGetPCIBusId(pci, sizeof pci, d.id) != cudaSuccess) std::snprintf(pci, sizeof pci, "-");
             std::snprintf(b, sizeof b,
                           "VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu kv_ram=0 act=%zu drafter=%zu window=0 "
-                          "pool=%zu tail=0 borrow=0 vision=0 vision_own=%zu slots=%lld ctx=%lld layers=%d-%d",
-                          d.id, pci, tot, fr, d.weights - mtp_dense, d.caches, d.scratch, mtp_dense + mtp_exp,
-                          d.experts - mtp_exp, vis, slots, (long long) o.max_context, a, z);
+                          "pool=%zu tail=0 borrow=0 vision=0 vision_own=%zu prompt=%zu tp=%zu tp_n=%zu slots=%lld ctx=%lld "
+                          "layers=%d-%d",
+                          d.id, pci, tot, fr, d.weights - mtp_dense - tp_w, d.caches - tp_kv, d.scratch, mtp_dense + mtp_exp,
+                          d.experts - mtp_exp, vis, d.prompt, tp_w + tp_kv, tn, slots, (long long) o.max_context, a, z);
             v.push_back(b);
         }
         if (img_tok >= 0) {   // the server's image resize (DeepSeek's image_processor.py)

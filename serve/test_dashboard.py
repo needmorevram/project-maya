@@ -240,6 +240,18 @@ class GpuMap(unittest.TestCase):
         self.assertLessEqual(sum(g["parts"].values()), g["total"])
         self.assertEqual(g["free"], 0)
 
+    def test_strata_ds4s_prompt_buffers_and_tensor_parallel(self):
+        # (strata-ds4 at --tp 8: a 5060 Ti of the group of 8 - its prompt chunks' buffers and tensor parallel's copies
+        # told apart, the GLM engine's lines without them)
+        r = self.gm.parse("VRAM dev=3 pci=0000:05:00.0 total=16610951168 free=301989888 weights=268435456 kv=33554432 "
+                          "kv_ram=0 act=134217728 drafter=0 window=0 pool=13421772800 tail=0 borrow=0 vision=0 "
+                          "vision_own=0 prompt=1610612736 tp=805306368 tp_n=8 slots=3343 ctx=262144 layers=3-39")
+        (g,) = self.gm.view([r], [], engine_pid=100)
+        self.assertEqual((g["parts"]["prompt"], g["parts"]["tp"], g["tp_n"]), (1610612736, 805306368, 8))
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+        (h,) = self.gm.view([self.r], [], engine_pid=100)
+        self.assertEqual((h["parts"]["prompt"], h["parts"]["tp"], h["tp_n"]), (0, 0, 0))
+
     def test_two_parts_on_one_card_add_up(self):
         a = dict(self.r, layers=[0, 20], slots=500)
         b = dict(self.r, layers=[20, 45], slots=700, free=self.r["free"] - GB)
