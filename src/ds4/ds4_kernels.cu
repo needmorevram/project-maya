@@ -1384,6 +1384,11 @@ __global__ void wait_flags_kernel(const unsigned* flags, int n, int stride, unsi
     for (int i = 0; i < n; ++i) wait_at_least(flags + (size_t) i * stride, seq);
     __threadfence_system();
 }
+// a batch of table entries: *pairs[2i] = pairs[2i + 1] (the expert cache's recent slots, between windows)
+__global__ void tab_set_kernel(const unsigned long long* __restrict__ pairs, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) *(unsigned long long*) pairs[2 * i] = pairs[2 * i + 1];
+}
 __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
     __threadfence_system();
     *(volatile unsigned*) flag = v;
@@ -1930,6 +1935,9 @@ void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStre
     if (n > 0) wait_flags_kernel<<<1, 32, 0, s>>>(flags, n, stride, seq);
 }
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s) { set_flag_kernel<<<1, 1, 0, s>>>(flag, v); }
+void tab_set(const unsigned long long* pairs, int n, cudaStream_t s) {
+    if (n > 0) tab_set_kernel<<<cdiv(n, 128), 128, 0, s>>>(pairs, n);
+}
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
     const int slot = (int) (seq % (unsigned) a.slots);
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)

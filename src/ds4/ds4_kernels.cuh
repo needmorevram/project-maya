@@ -262,6 +262,8 @@ struct ArGroup {
     unsigned* bflags = nullptr;
 };
 constexpr int kArBlocks = 64;
+/// *pairs[2i] = pairs[2i + 1] for i < n (pairs: host-mapped or device memory): table entries set in one launch
+void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
 /// A chunk's all-reduce (three members or more) through the copy engines: allreduce's FP16 sums bit for bit (each
 /// partial rounded to FP16, each value summed in member order and rounded), the bytes moved by cudaMemcpyAsync where
