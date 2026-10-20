@@ -524,6 +524,7 @@ struct Chunk {
     unsigned* hand_flag[2] = {nullptr, nullptr};
     unsigned* hand_ack = nullptr;
     unsigned arb_seq = 0;        // the group's chunk all-reduces
+    ArAux ar_aux;                // (allreduce_dma's pieces: its copies out on a stream of their own)
     // pinned, two chunks in flight: the embedding rows (the first layer's device), the Engram rows (an Engram layer's)
     uint16_t* emb_host[2] = {nullptr, nullptr};
     cudaEvent_t emb_ev[2] = {nullptr, nullptr}, eg_ev[kEgSlots] = {};   // (eg_ev: its copies from each Engram slot)
@@ -1880,6 +1881,8 @@ struct Model::Impl {
             }
             if (d.mi == 0 && !hmap(c.hand_ack, (size_t) 2 * 8 * 32, err)) return false;
             for (int sl = 0; sl < kEgSlots; ++sl) CK(cudaEventCreateWithFlags(&c.eg_ev[sl], cudaEventDisableTiming));
+            CK(cudaStreamCreateWithFlags(&c.ar_aux.s2, cudaStreamNonBlocking));
+            for (cudaEvent_t& e : c.ar_aux.ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         }
         // the prompt's Engram rows: the shared slots, the reader's IO pool (DS4_EG_READERS, 48), the devices that copy
         eg_copies = 0;
@@ -3718,7 +3721,7 @@ struct Model::Impl {
             const char* e = std::getenv("DS4_AR_DMA");
             return e == nullptr || std::atoi(e) != 0;
         }();
-        if (dma && ab.nm > 2 && ab.sums != nullptr && ab.bflags != nullptr) allreduce_dma(c.acc, n, ab, mi, ++c.arb_seq, c.y, s);
+        if (dma && ab.nm > 2 && ab.sums != nullptr && ab.bflags != nullptr) allreduce_dma(c.acc, n, ab, mi, ++c.arb_seq, c.y, s, &c.ar_aux);
         else allreduce(c.acc, n, ab, mi, ++c.arb_seq, d.xcnt, s);
     }
 

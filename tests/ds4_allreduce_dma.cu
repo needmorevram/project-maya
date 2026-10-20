@@ -39,9 +39,9 @@ int hmap(T*& p, size_t n) {
 }
 
 // nm members on GPUs 0..nm-1: rounds of all-reduces of n values (DMA or kernel), the results on the host
-int run(int nm, int n, int rounds, bool dma, unsigned& seq, ArGroup& a, std::vector<float*>& x, std::vector<void*>& scr,
+int run(int nm, int n, int rounds, int dma, unsigned& seq, ArGroup& a, std::vector<float*>& x, std::vector<void*>& scr,
         std::vector<cudaStream_t>& st, std::vector<unsigned*>& cnt, const std::vector<std::vector<float>>& in,
-        std::vector<std::vector<float>>& out, double& ms) {
+        std::vector<std::vector<float>>& out, double& ms, std::vector<ArAux>& aux) {
     ms = 0;
     for (int r = 0; r < rounds; ++r) {
         for (int m = 0; m < nm; ++m) {
@@ -53,7 +53,7 @@ int run(int nm, int n, int rounds, bool dma, unsigned& seq, ArGroup& a, std::vec
         const double t0 = now_ms();
         for (int m = 0; m < nm; ++m) {
             CK(cudaSetDevice(m));
-            if (dma) allreduce_dma(x[m], n, a, m, seq, scr[m], st[m]);
+            if (dma) allreduce_dma(x[m], n, a, m, seq, scr[m], st[m], dma == 2 ? &aux[m] : nullptr);
             else allreduce(x[m], n, a, m, seq, cnt[m], st[m]);
         }
         for (int m = 0; m < nm; ++m) {
@@ -94,6 +94,7 @@ int main() {
         std::vector<void*> scr(nm);
         std::vector<cudaStream_t> st(nm);
         std::vector<unsigned*> cnt(nm);
+        std::vector<ArAux> aux(nm);
         for (int m = 0; m < nm; ++m) {
             CK(cudaSetDevice(m));
             CK(cudaMalloc(&x[m], stride * 4));
@@ -101,6 +102,8 @@ int main() {
             CK(cudaStreamCreateWithFlags(&st[m], cudaStreamNonBlocking));
             CK(cudaMalloc(&cnt[m], 64));
             CK(cudaMemset(cnt[m], 0, 64));
+            CK(cudaStreamCreateWithFlags(&aux[m].s2, cudaStreamNonBlocking));
+            for (cudaEvent_t& e : aux[m].ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         }
         unsigned seq = 0;
         for (int T : {16, 333, 2048}) {
@@ -108,16 +111,19 @@ int main() {
             std::vector<std::vector<float>> in((size_t) rounds * nm, std::vector<float>((size_t) n));
             for (auto& v : in)
                 for (float& f : v) f = nd(rng) * (rng() % 16 == 0 ? 300.0f : 1.0f);   // (a few past FP16's steps)
-            std::vector<std::vector<float>> o1((size_t) rounds * nm), o2((size_t) rounds * nm);
-            double ms1 = 0, ms2 = 0;
-            if (run(nm, n, rounds, false, seq, a, x, scr, st, cnt, in, o1, ms1)) return 1;
-            if (run(nm, n, rounds, true, seq, a, x, scr, st, cnt, in, o2, ms2)) return 1;
+            std::vector<std::vector<float>> o1((size_t) rounds * nm), o2((size_t) rounds * nm), o3((size_t) rounds * nm);
+            double ms1 = 0, ms2 = 0, ms3 = 0;
+            if (run(nm, n, rounds, 0, seq, a, x, scr, st, cnt, in, o1, ms1, aux)) return 1;
+            if (run(nm, n, rounds, 1, seq, a, x, scr, st, cnt, in, o2, ms2, aux)) return 1;
+            if (run(nm, n, rounds, 2, seq, a, x, scr, st, cnt, in, o3, ms3, aux)) return 1;
             bool same = true;
             for (size_t i = 0; i < o1.size(); ++i)
                 same = same && std::memcmp(o1[i].data(), o2[i].data(), (size_t) n * 4) == 0 &&
+                       std::memcmp(o1[i].data(), o3[i].data(), (size_t) n * 4) == 0 &&
                        std::memcmp(o2[i].data(), o2[i - i % nm].data(), (size_t) n * 4) == 0;   // (every member alike)
-            std::printf("allreduce, %d members, %d x %d values (%.1f MB FP16): DMA %s the kernel's; kernel %.2f ms, DMA "
-                        "%.2f ms\n", nm, T, D, n * 2 / 1e6, same ? "bit for bit" : "DIFFERENT from", ms1, ms2);
+            std::printf("allreduce, %d members, %d x %d values (%.1f MB FP16): DMA / pieces %s the kernel's; kernel %.2f ms, "
+                        "DMA %.2f ms, in pieces %.2f ms\n", nm, T, D, n * 2 / 1e6, same ? "bit for bit" : "DIFFERENT from",
+                        ms1, ms2, ms3);
             fails += !same;
         }
     }

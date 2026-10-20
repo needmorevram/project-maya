@@ -264,6 +264,13 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
 /// A chunk's all-reduce (three members or more) through the copy engines: allreduce's FP16 sums bit for bit (each
 /// partial rounded to FP16, each value summed in member order and rounded), the bytes moved by cudaMemcpyAsync where
 /// ar_rs16_kernel's loads read host memory a round trip at a time.  scratch: n * 4 + nm * 8 bytes on the device.
-void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s);
+/// The pieces allreduce_dma's phases overlap in (aux): a second stream for the copies out and events between them.
+constexpr int kArPieces = 4;
+struct ArAux {
+    cudaStream_t s2 = nullptr;
+    cudaEvent_t ev[1 + kArPieces] = {};
+};
+void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s,
+                   const ArAux* aux = nullptr);
 
 }  // namespace strata::ds4

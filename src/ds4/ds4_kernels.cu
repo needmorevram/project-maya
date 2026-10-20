@@ -1538,8 +1538,8 @@ __global__ void ar_sum16_zc_kernel(float4* x, uint2* own, const uint2* rows, siz
         x[q] = from_h4(s16);
     }
 }
-__global__ void ar_from16_zc_kernel(float4* x, const uint2* hsum, int n4, int q0, int q1) {
-    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
+__global__ void ar_from16_zc_kernel(float4* x, const uint2* hsum, int n4, int q0, int q1, int r0 = 0) {
+    for (int q = r0 + blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
         if (q < q0 || q >= q1) x[q] = from_h4(__ldcv(hsum + q));
 }
 __global__ void ar_from16_kernel(float4* x, const uint2* __restrict__ h, int n4, int q0, int q1) {
@@ -1940,7 +1940,8 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     ar_sum_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
 }
 
-void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s) {
+void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s,
+                   const ArAux* aux) {
     const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm;
     const int n4 = n / 4, cq = (n4 + nm - 1) / nm;
     const int c0 = std::min(n4, mi * cq), c1 = std::min(n4, (mi + 1) * cq);
@@ -1954,16 +1955,64 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
     const int fs = a.slots * kArBlocks * 8;
     const int blocks = std::max(1, std::min(1024, cdiv(n4, kThreads)));
     ar_to16_kernel<<<blocks, kThreads, 0, s>>>((const float4*) x, n4, own);
-    if (c0 > 0) cudaMemcpyAsync(hrow(mi), own, (size_t) c0 * 8, cudaMemcpyDeviceToHost, s);   // (the others' slices)
-    if (c1 < n4) cudaMemcpyAsync(hrow(mi) + c1, own + c1, (size_t) (n4 - c1) * 8, cudaMemcpyDeviceToHost, s);
-    set_flag_kernel<<<1, 1, 0, s>>>(rf + (size_t) mi * fs, seq);
-    wait_flags_kernel<<<1, 32, 0, s>>>(rf, nm, fs, seq);
     // the H2D side by the SMs up to 4 members (16K-token prompt on 9 GPUs, --tp 4: 743 -> 785 tok/s), the copy
     // engine past that (--tp 8: 719 by the copy engine, 676 by the SMs); DS4_AR_ZC=0 / 1 / 2.. sets the most members
     static const int zc_max = [] {
         const char* e = std::getenv("DS4_AR_ZC");
         return e != nullptr ? std::atoi(e) : 4;
     }();
+    if (nm <= std::min(8, zc_max) && aux != nullptr && aux->s2 != nullptr) {
+        // in kArPieces pieces, each cut in nm slices: the copies out on s2 (the D2H engine) beside the sums' and the
+        // gather's reads on s (the SMs, H2D) - piece p + 1 goes out while piece p is summed; ar_rs16's flags, a
+        // block's slot a piece.  (The first flags wait for every member's partial of the piece; s's last gather waits
+        // for this member's own copies too, so c.y is free again past it.)
+        const int P4 = cdiv(n4, kArPieces);
+        auto piece = [&](int p, int& p0, int& p1, int& q0, int& q1) {
+            p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
+            const int cqp = cdiv(std::max(1, p1 - p0), nm);
+            q0 = std::min(p1, p0 + mi * cqp), q1 = std::min(p1, q0 + cqp);
+        };
+        auto rfp = [&](int p) { return a.bflags + ((size_t) slot * kArBlocks + p) * 8; };
+        auto sfp = [&](int p) { return a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8; };
+        cudaEventRecord(aux->ev[0], s);
+        cudaStreamWaitEvent(aux->s2, aux->ev[0], 0);
+        for (int p = 0; p < kArPieces; ++p) {
+            int p0, p1, q0, q1;
+            piece(p, p0, p1, q0, q1);
+            if (q0 > p0) cudaMemcpyAsync(hrow(mi) + p0, own + p0, (size_t) (q0 - p0) * 8, cudaMemcpyDeviceToHost, aux->s2);
+            if (p1 > q1) cudaMemcpyAsync(hrow(mi) + q1, own + q1, (size_t) (p1 - q1) * 8, cudaMemcpyDeviceToHost, aux->s2);
+            set_flag_kernel<<<1, 1, 0, aux->s2>>>(rfp(p) + (size_t) mi * fs, seq);
+        }
+        for (int p = 0; p < kArPieces; ++p) {
+            int p0, p1, q0, q1;
+            piece(p, p0, p1, q0, q1);
+            wait_flags_kernel<<<1, 32, 0, s>>>(rfp(p), nm, fs, seq);
+            if (q1 > q0)
+                ar_sum16_zc_kernel<<<std::max(1, std::min(1024, cdiv(q1 - q0, kThreads))), kThreads, 0, s>>>(
+                    (float4*) x, own, hrow(0), a.slots * a.stride / 2, nm, mi, q0, q1);
+            cudaEventRecord(aux->ev[1 + p], s);
+        }
+        for (int p = 0; p < kArPieces; ++p) {
+            int p0, p1, q0, q1;
+            piece(p, p0, p1, q0, q1);
+            cudaStreamWaitEvent(aux->s2, aux->ev[1 + p], 0);
+            if (q1 > q0) cudaMemcpyAsync(hsum + q0, own + q0, (size_t) (q1 - q0) * 8, cudaMemcpyDeviceToHost, aux->s2);
+            set_flag_kernel<<<1, 1, 0, aux->s2>>>(sfp(p) + (size_t) mi * fs, seq);
+        }
+        for (int p = 0; p < kArPieces; ++p) {
+            int p0, p1, q0, q1;
+            piece(p, p0, p1, q0, q1);
+            wait_flags_kernel<<<1, 32, 0, s>>>(sfp(p), nm, fs, seq);
+            if (p1 > p0)
+                ar_from16_zc_kernel<<<std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s>>>(
+                    (float4*) x, hsum, p1, q0, q1, p0);
+        }
+        return;
+    }
+    if (c0 > 0) cudaMemcpyAsync(hrow(mi), own, (size_t) c0 * 8, cudaMemcpyDeviceToHost, s);   // (the others' slices)
+    if (c1 < n4) cudaMemcpyAsync(hrow(mi) + c1, own + c1, (size_t) (n4 - c1) * 8, cudaMemcpyDeviceToHost, s);
+    set_flag_kernel<<<1, 1, 0, s>>>(rf + (size_t) mi * fs, seq);
+    wait_flags_kernel<<<1, 32, 0, s>>>(rf, nm, fs, seq);
     if (nm <= std::min(8, zc_max)) {
         const int nb = std::max(1, std::min(1024, cdiv(c1 - c0, kThreads)));
         if (c1 > c0) {
