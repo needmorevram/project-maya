@@ -525,6 +525,11 @@ struct Chunk {
     unsigned* hand_ack = nullptr;
     unsigned arb_seq = 0;        // the group's chunk all-reduces
     ArAux ar_aux;                // (allreduce_dma's pieces: its copies out on a stream of their own)
+    // the attention's sums slab by slab beside the next slab's compute: a stream of their own (its own ArAux), and
+    // the main stream waits for the last before the residual (DS4_AR_OVERLAP=0: on the main stream, whole)
+    cudaStream_t ar_s = nullptr;
+    ArAux ar_aux2;
+    cudaEvent_t ar_go = nullptr, ar_done = nullptr;
     // pinned, two chunks in flight: the embedding rows (the first layer's device), the Engram rows (an Engram layer's)
     uint16_t* emb_host[2] = {nullptr, nullptr};
     cudaEvent_t emb_ev[2] = {nullptr, nullptr}, eg_ev[kEgSlots] = {};   // (eg_ev: its copies from each Engram slot)
@@ -684,6 +689,7 @@ struct Group {
     // lead's acknowledgements (host-mapped)
     float* lg_stage = nullptr;
     unsigned *lg_flag = nullptr, *lg_ack = nullptr;
+    std::shared_ptr<HostReducer> hred;   // a chunk's all-reduces summed on the host (5 members or more)
 };
 
 constexpr int kMaxL = 64;   // layers (the trunk's and the drafter's) a window plan covers
@@ -1586,6 +1592,17 @@ struct Model::Impl {
                 (!hmap(G.arb.sums, (size_t) G.arb.slots * G.arb.stride, err) ||
                  !hmap(G.arb.bflags, (size_t) 2 * G.arb.nm * G.arb.slots * kArBlocks * 8, err)))
                 return false;
+            // 5 members or more: a chunk's sums by the host (DS4_AR_HOST: the members from which, 0 off; threads
+            // DS4_AR_HOST_THREADS, 32)
+            const char* hm = std::getenv("DS4_AR_HOST");
+            const int host_from = hm != nullptr ? std::atoi(hm) : 5;
+            if (chunk > 0 && host_from > 0 && G.arb.nm >= host_from && G.arb.nm <= 16 && G.arb.sums != nullptr) {
+                const char* ht = std::getenv("DS4_AR_HOST_THREADS");
+                std::vector<int> ids;
+                for (int m : G.mem) ids.push_back(devs[(size_t) m].id);
+                G.hred = std::make_shared<HostReducer>(G.arb, ids, G.arb.stride, ht != nullptr ? std::max(1, std::atoi(ht)) : 32);
+                if (!G.hred->ok()) G.hred.reset();   // (the sums by the copy engines then)
+            }
         }
         if (g.n_mtp > 0) {
             if (!halloc(h_taps, (size_t) tap_cap * g.d_targets.size() * g.dim, err)) return false;
@@ -1883,6 +1900,11 @@ struct Model::Impl {
             for (int sl = 0; sl < kEgSlots; ++sl) CK(cudaEventCreateWithFlags(&c.eg_ev[sl], cudaEventDisableTiming));
             CK(cudaStreamCreateWithFlags(&c.ar_aux.s2, cudaStreamNonBlocking));
             for (cudaEvent_t& e : c.ar_aux.ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            CK(cudaStreamCreateWithFlags(&c.ar_s, cudaStreamNonBlocking));
+            CK(cudaStreamCreateWithFlags(&c.ar_aux2.s2, cudaStreamNonBlocking));
+            for (cudaEvent_t& e : c.ar_aux2.ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&c.ar_go, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&c.ar_done, cudaEventDisableTiming));
         }
         // the prompt's Engram rows: the shared slots, the reader's IO pool (DS4_EG_READERS, 48), the devices that copy
         eg_copies = 0;
@@ -3717,12 +3739,23 @@ struct Model::Impl {
     // a chunk's sum over its group: three members or more through the copy engines (allreduce_dma, c.y its scratch:
     // free between the MoE's sets), unless DS4_AR_DMA=0
     void chunk_allreduce(Dev& d, Chunk& c, const ArGroup& ab, int mi, int n, cudaStream_t s) {
+        chunk_allreduce_on(d, c, ab, mi, c.acc, n, s, c.ar_aux);
+    }
+    void chunk_allreduce_on(Dev& d, Chunk& c, const ArGroup& ab, int mi, float* buf, int n, cudaStream_t s,
+                            ArAux& aux) {
         static const bool dma = [] {
             const char* e = std::getenv("DS4_AR_DMA");
             return e == nullptr || std::atoi(e) != 0;
         }();
-        if (dma && ab.nm > 2 && ab.sums != nullptr && ab.bflags != nullptr) allreduce_dma(c.acc, n, ab, mi, ++c.arb_seq, c.y, s, &c.ar_aux);
-        else allreduce(c.acc, n, ab, mi, ++c.arb_seq, d.xcnt, s);
+        HostReducer* hr = groups[(size_t) d.grp].hred.get();
+        if (dma && hr != nullptr) {   // (the lead submits the sum before its members' copies come)
+            const unsigned seq = ++c.arb_seq;
+            if (mi == 0) hr->submit(seq, n);
+            allreduce_host(buf, n, ab, *hr, mi, seq, c.y, s, aux);
+            return;
+        }
+        if (dma && ab.nm > 2 && ab.sums != nullptr && ab.bflags != nullptr) allreduce_dma(buf, n, ab, mi, ++c.arb_seq, c.y, s, &aux);
+        else allreduce(buf, n, ab, mi, ++c.arb_seq, d.xcnt, s);
     }
 
     bool layer_chunk(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err) {
@@ -3903,10 +3936,24 @@ struct Model::Impl {
             }
             ckv = sr.ckv[(size_t) l.dev];
         }
-        // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc
-        if (NHL == 0) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
-        for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
+        // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc; with three
+        // members or more each slab's sum on ar_s while the next slab computes (every member the same slabs: c.A
+        // is the group's, a member without heads its zeros)
+        static const bool overlap = [] {
+            const char* e = std::getenv("DS4_AR_OVERLAP");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        const bool slab_ar = overlap && nm > 2 && c.ar_s != nullptr;
+        if (NHL == 0 && !slab_ar) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
+        for (int a0 = 0; a0 < T && (NHL > 0 || slab_ar); a0 += c.A) {
             const int na = std::min(c.A, T - a0);
+            if (NHL == 0) {
+                CK(cudaMemsetAsync(c.acc + (size_t) a0 * D, 0, (size_t) na * D * sizeof(*c.acc), s));
+                CK(cudaEventRecord(c.ar_go, s));
+                CK(cudaStreamWaitEvent(c.ar_s, c.ar_go, 0));
+                chunk_allreduce_on(d, c, ab, mi, c.acc + (size_t) a0 * D, na * D, c.ar_s, c.ar_aux2);
+                continue;
+            }
             if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
             Finish fr;
             fr.rd = g.rd;
@@ -3939,8 +3986,17 @@ struct Model::Impl {
                     return false;
             x3::rows_f16(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s);
             if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
+            if (slab_ar) {
+                CK(cudaEventRecord(c.ar_go, s));
+                CK(cudaStreamWaitEvent(c.ar_s, c.ar_go, 0));
+                chunk_allreduce_on(d, c, ab, mi, c.acc + (size_t) a0 * D, na * D, c.ar_s, c.ar_aux2);
+            }
         }
-        if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
+        if (slab_ar) {   // (the residual and the MoE after every slab's sum)
+            CK(cudaEventRecord(c.ar_done, c.ar_s));
+            CK(cudaStreamWaitEvent(s, c.ar_done, 0));
+        } else if (nm > 1)
+            chunk_allreduce(d, c, ab, mi, T * D, s);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
         // the MoE
         if (!hc_mix_chunk(d, c, c.h, l.hcf_fn, T, c.mix, err)) return false;
@@ -4187,9 +4243,19 @@ struct Model::Impl {
                 err = "token " + std::to_string(tk[t]) + " out of range";
                 return false;
             }
-        const int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
+        // equal chunks of at most `chunk`; DS4_CHUNK_FIRST=N: the first one N tokens, the rest equal - the first
+        // group hands the next one its first chunk sooner (the pipeline's start), the rest stream the experts as few
+        // times as before
+        static const int first_env = std::getenv("DS4_CHUNK_FIRST") ? std::atoi(std::getenv("DS4_CHUNK_FIRST")) : 0;
+        const int first = first_env > 0 && n > first_env + 16 ? std::min(chunk, std::max(16, first_env / 16 * 16)) : 0;
         Run run;
-        for (int a = 0; a < n; a += per) {
+        if (first > 0) {
+            run.p0.push_back(pos);
+            run.T.push_back(first);
+            run.seq.push_back(++win_seq);
+        }
+        const int rest = n - first, nc = (rest + chunk - 1) / chunk, per = (rest + nc - 1) / nc;
+        for (int a = first; a < n; a += per) {
             run.p0.push_back(pos + a);
             run.T.push_back(std::min(per, n - a));
             run.seq.push_back(++win_seq);

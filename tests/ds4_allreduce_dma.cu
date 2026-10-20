@@ -2,7 +2,8 @@
 // ar_rs16_kernel's (allreduce, three members or more): the same FP16 sums bit for bit on every member, a chunk's row
 // (16..2048 tokens of 5120 values) at a time, several in a row on the two slots; and how long each takes.  One member a
 // GPU (4, then 8 of them when there are).
-//   nvcc -O3 -std=c++17 -arch=native -I src/ds4 tests/ds4_allreduce_dma.cu src/ds4/ds4_kernels.cu -o build/ds4_allreduce_dma
+//   nvcc -O3 -std=c++17 -arch=native -I src/ds4 tests/ds4_allreduce_dma.cu src/ds4/ds4_kernels.cu src/ds4/ds4_host_ar.cpp \
+//        -o build/ds4_allreduce_dma
 #include "ds4_kernels.cuh"
 
 #include <chrono>
@@ -41,7 +42,7 @@ int hmap(T*& p, size_t n) {
 // nm members on GPUs 0..nm-1: rounds of all-reduces of n values (DMA or kernel), the results on the host
 int run(int nm, int n, int rounds, int dma, unsigned& seq, ArGroup& a, std::vector<float*>& x, std::vector<void*>& scr,
         std::vector<cudaStream_t>& st, std::vector<unsigned*>& cnt, const std::vector<std::vector<float>>& in,
-        std::vector<std::vector<float>>& out, double& ms, std::vector<ArAux>& aux) {
+        std::vector<std::vector<float>>& out, double& ms, std::vector<ArAux>& aux, HostReducer* hr = nullptr) {
     ms = 0;
     for (int r = 0; r < rounds; ++r) {
         for (int m = 0; m < nm; ++m) {
@@ -51,9 +52,11 @@ int run(int nm, int n, int rounds, int dma, unsigned& seq, ArGroup& a, std::vect
         }
         ++seq;
         const double t0 = now_ms();
+        if (dma == 3) hr->submit(seq, n);
         for (int m = 0; m < nm; ++m) {
             CK(cudaSetDevice(m));
-            if (dma) allreduce_dma(x[m], n, a, m, seq, scr[m], st[m], dma == 2 ? &aux[m] : nullptr);
+            if (dma == 3) allreduce_host(x[m], n, a, *hr, m, seq, scr[m], st[m], aux[m]);
+            else if (dma) allreduce_dma(x[m], n, a, m, seq, scr[m], st[m], dma == 2 ? &aux[m] : nullptr);
             else allreduce(x[m], n, a, m, seq, cnt[m], st[m]);
         }
         for (int m = 0; m < nm; ++m) {
@@ -106,24 +109,30 @@ int main() {
             for (cudaEvent_t& e : aux[m].ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         }
         unsigned seq = 0;
+        std::vector<int> ids;
+        for (int m = 0; m < nm; ++m) ids.push_back(m);
+        HostReducer hr(a, ids, stride, 32);
         for (int T : {16, 333, 2048}) {
             const int n = T * D;
             std::vector<std::vector<float>> in((size_t) rounds * nm, std::vector<float>((size_t) n));
             for (auto& v : in)
                 for (float& f : v) f = nd(rng) * (rng() % 16 == 0 ? 300.0f : 1.0f);   // (a few past FP16's steps)
-            std::vector<std::vector<float>> o1((size_t) rounds * nm), o2((size_t) rounds * nm), o3((size_t) rounds * nm);
-            double ms1 = 0, ms2 = 0, ms3 = 0;
+            std::vector<std::vector<float>> o1((size_t) rounds * nm), o2((size_t) rounds * nm), o3((size_t) rounds * nm),
+                o4((size_t) rounds * nm);
+            double ms1 = 0, ms2 = 0, ms3 = 0, ms4 = 0;
             if (run(nm, n, rounds, 0, seq, a, x, scr, st, cnt, in, o1, ms1, aux)) return 1;
             if (run(nm, n, rounds, 1, seq, a, x, scr, st, cnt, in, o2, ms2, aux)) return 1;
             if (run(nm, n, rounds, 2, seq, a, x, scr, st, cnt, in, o3, ms3, aux)) return 1;
+            if (run(nm, n, rounds, 3, seq, a, x, scr, st, cnt, in, o4, ms4, aux, &hr)) return 1;
             bool same = true;
             for (size_t i = 0; i < o1.size(); ++i)
                 same = same && std::memcmp(o1[i].data(), o2[i].data(), (size_t) n * 4) == 0 &&
                        std::memcmp(o1[i].data(), o3[i].data(), (size_t) n * 4) == 0 &&
+                       std::memcmp(o1[i].data(), o4[i].data(), (size_t) n * 4) == 0 &&
                        std::memcmp(o2[i].data(), o2[i - i % nm].data(), (size_t) n * 4) == 0;   // (every member alike)
-            std::printf("allreduce, %d members, %d x %d values (%.1f MB FP16): DMA / pieces %s the kernel's; kernel %.2f ms, "
-                        "DMA %.2f ms, in pieces %.2f ms\n", nm, T, D, n * 2 / 1e6, same ? "bit for bit" : "DIFFERENT from",
-                        ms1, ms2, ms3);
+            std::printf("allreduce, %d members, %d x %d values (%.1f MB FP16): DMA / pieces / host %s the kernel's; kernel "
+                        "%.2f ms, DMA %.2f ms, in pieces %.2f ms, summed by the host %.2f ms\n", nm, T, D, n * 2 / 1e6,
+                        same ? "bit for bit" : "DIFFERENT from", ms1, ms2, ms3, ms4);
             fails += !same;
         }
     }

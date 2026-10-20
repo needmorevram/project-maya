@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include <vector>
+
 namespace strata::ds4 {
 
 constexpr int kWin = 16;      // tokens a window takes at most (the EXL3 GEMV's activations per job)
@@ -272,5 +274,30 @@ struct ArAux {
 };
 void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s,
                    const ArAux* aux = nullptr);
+/// A chunk's all-reduce summed by the host: each member's FP16 partial out on aux's stream (the D2H engine) in
+/// kArPieces pieces, the group's HostReducer sums each piece once every member's is in (ar_host_sum: ar_rs16_kernel's
+/// arithmetic), each member reads the sums back with the SMs - a member's H2D the row once, where the reduce-scatter
+/// read it nearly twice.  The group's lead submits each all-reduce (seq, n) to the reducer as it enqueues it.
+void ar_host_sum(const uint16_t* const* rows, int nm, uint16_t* out, size_t i0, size_t i1);
+/// pieces an all-reduce is cut in (DS4_AR_HOST_PIECES, 4; at most kArBlocks)
+int ar_host_pieces();
+class HostReducer {
+public:
+    /// devs: the members' CUDA devices (each one's partials in host memory on its NUMA node, the sums on the node most
+    /// of them are on); max_n: the most values an all-reduce has; threads: the sum's
+    HostReducer(const ArGroup& a, const std::vector<int>& devs, size_t max_n, int threads);
+    ~HostReducer();
+    bool ok() const;
+    void submit(unsigned seq, int n);
+    uint16_t* row(int m, int slot) const;   // member m's FP16 partials, slot `slot` (host-mapped)
+    uint16_t* sum(int slot) const;
+    HostReducer(const HostReducer&) = delete;
+    HostReducer& operator=(const HostReducer&) = delete;
+private:
+    struct Impl;
+    Impl* p_;
+};
+void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
+                    cudaStream_t s, const ArAux& aux);
 
 }  // namespace strata::ds4

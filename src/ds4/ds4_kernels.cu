@@ -1,6 +1,7 @@
 // src/ds4/ds4_kernels.cu - DeepSeek-V4.1's device kernels (see ds4_kernels.cuh).  No fast math here: the rotary
 // angles, the softmaxes and the roundings follow the reference's F32 arithmetic.  A window's token is blockIdx.y.
 #include "ds4_kernels.cuh"
+#include "ds4_pool.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -9,6 +10,21 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <cstring>
+#include <cctype>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/mman.h>
+#include <vector>
+#include <chrono>
+#include <atomic>
+#include <immintrin.h>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
 
 namespace strata::ds4 {
 namespace {
@@ -2039,4 +2055,181 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
     ar_from16_kernel<<<blocks, kThreads, 0, s>>>((float4*) x, own, n4, c0, c1);
 }
 
+// ---------------------------------------------------------------- the host-summed all-reduce
+int ar_host_pieces() {
+    static const int n = [] {
+        const char* e = std::getenv("DS4_AR_HOST_PIECES");
+        return std::max(1, std::min(kArBlocks, e != nullptr ? std::atoi(e) : 4));
+    }();
+    return n;
+}
+namespace {
+int cuda_numa_node(int dev) {   // (-1: unknown)
+    char bus[32] = {};
+    if (cudaDeviceGetPCIBusId(bus, sizeof bus, dev) != cudaSuccess) return -1;
+    std::string id(bus);
+    for (char& c : id) c = (char) std::tolower((unsigned char) c);
+    std::FILE* f = std::fopen(("/sys/bus/pci/devices/" + id + "/numa_node").c_str(), "r");
+    if (f == nullptr) return -1;
+    int node = -1;
+    if (std::fscanf(f, "%d", &node) != 1) node = -1;
+    std::fclose(f);
+    return node;
+}
+// pinned host memory on NUMA node `node` (-1: anywhere), mapped for every device
+void* numa_pinned(size_t bytes, int node) {
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    if (node >= 0) {
+        unsigned long mask[4] = {0, 0, 0, 0};
+        mask[node / 64] = 1ul << (node % 64);
+        syscall(SYS_mbind, p, bytes, 2 /* MPOL_BIND */, mask, 256, 0);
+    }
+    std::memset(p, 0, bytes);
+    if (cudaHostRegister(p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        munmap(p, bytes);
+        return nullptr;
+    }
+    return p;
+}
+}  // namespace
+
+struct HostReducer::Impl {
+    ArGroup a;
+    size_t max_n = 0, bytes = 0;
+    std::vector<uint16_t*> rows;   // [member]: slots x max_n
+    uint16_t* sums = nullptr;      // slots x max_n
+    std::unique_ptr<Pool> pool;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::pair<unsigned, int>> q;
+    bool quit = false;
+    std::thread th;
+    double t_wait = 0, t_sum = 0;   // (DS4_AR_HOST_STATS: printed at the end)
+    long n_sums = 0;
+    void loop() {
+        for (;;) {
+            std::pair<unsigned, int> job;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return quit || !q.empty(); });
+                if (q.empty()) return;
+                job = q.front();
+                q.pop_front();
+            }
+            const unsigned seq = job.first;
+            const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm, n4 = job.second / 4;
+            const int NP = ar_host_pieces(), P4 = (n4 + NP - 1) / NP, fs = a.slots * kArBlocks * 8;
+            const uint16_t* rp[16];
+            for (int m = 0; m < nm && m < 16; ++m) rp[m] = rows[(size_t) m] + (size_t) slot * max_n;
+            uint16_t* out = sums + (size_t) slot * max_n;
+            for (int p = 0; p < NP; ++p) {
+                const size_t h0 = (size_t) std::min(n4, p * P4) * 4, h1 = (size_t) std::min(n4, (p + 1) * P4) * 4;
+                const unsigned* rf = a.bflags + ((size_t) slot * kArBlocks + p) * 8;
+                const auto tw = std::chrono::steady_clock::now();
+                for (int m = 0; m < nm; ++m) {   // (every member's piece out: its flag, after its copy)
+                    int spins = 0;
+                    while ((int) (*(volatile const unsigned*) (rf + (size_t) m * fs) - seq) < 0) {
+                        if (++spins > 2000) std::this_thread::sleep_for(std::chrono::microseconds(20));
+                        else _mm_pause();
+                    }
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const auto ts = std::chrono::steady_clock::now();
+                t_wait += std::chrono::duration<double, std::milli>(ts - tw).count();
+                const int T = pool->size();
+                pool->run(T, [&](int t) {
+                    const size_t a0 = h0 + (h1 - h0) * (size_t) t / (size_t) T / 8 * 8,
+                                 a1 = t + 1 == T ? h1 : h0 + (h1 - h0) * (size_t) (t + 1) / (size_t) T / 8 * 8;
+                    if (a1 > a0) ar_host_sum(rp, nm, out, a0, a1);
+                });
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                *(volatile unsigned*) (a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8) = seq;
+                t_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
+                ++n_sums;
+            }
+        }
+    }
+};
+HostReducer::HostReducer(const ArGroup& a, const std::vector<int>& devs, size_t max_n, int threads) : p_(new Impl) {
+    p_->a = a;
+    p_->max_n = (max_n + 63) / 64 * 64;
+    p_->bytes = (size_t) a.slots * p_->max_n * 2;
+    std::vector<int> nodes;
+    for (int dv : devs) nodes.push_back(cuda_numa_node(dv));
+    int sum_node = -1, best = 0;
+    for (int nd : nodes) {
+        const int c = (int) std::count(nodes.begin(), nodes.end(), nd);
+        if (nd >= 0 && c > best) best = c, sum_node = nd;
+    }
+    for (size_t m = 0; m < devs.size(); ++m) p_->rows.push_back((uint16_t*) numa_pinned(p_->bytes, nodes[m]));
+    p_->sums = (uint16_t*) numa_pinned(p_->bytes, sum_node);
+    std::vector<int> cpus;   // (DS4_AR_HOST_PIN=1: pinned to the physical cores, both nodes interleaved)
+    if (const char* pe = std::getenv("DS4_AR_HOST_PIN"); pe != nullptr && std::atoi(pe) != 0)
+        for (int c = 0; c < (int) std::thread::hardware_concurrency() / 2; ++c) cpus.push_back(c);
+    p_->pool = std::make_unique<Pool>(std::max(0, threads - 1), cpus, 2000);
+    p_->th = std::thread([this] { p_->loop(); });
+}
+bool HostReducer::ok() const {
+    if (p_->sums == nullptr) return false;
+    for (uint16_t* r : p_->rows)
+        if (r == nullptr) return false;
+    return true;
+}
+uint16_t* HostReducer::row(int m, int slot) const { return p_->rows[(size_t) m] + (size_t) slot * p_->max_n; }
+uint16_t* HostReducer::sum(int slot) const { return p_->sums + (size_t) slot * p_->max_n; }
+HostReducer::~HostReducer() {
+    {
+        std::lock_guard<std::mutex> lk(p_->mu);
+        p_->quit = true;
+    }
+    p_->cv.notify_all();
+    if (p_->th.joinable()) p_->th.join();
+    if (std::getenv("DS4_AR_HOST_STATS") != nullptr)
+        std::fprintf(stderr, "host all-reduce: %ld pieces summed, waiting %.1f ms, summing %.1f ms\n", p_->n_sums,
+                     p_->t_wait, p_->t_sum);
+    for (uint16_t* r : p_->rows)
+        if (r != nullptr) {
+            cudaHostUnregister(r);
+            munmap(r, p_->bytes);
+        }
+    if (p_->sums != nullptr) {
+        cudaHostUnregister(p_->sums);
+        munmap(p_->sums, p_->bytes);
+    }
+    delete p_;
+}
+void HostReducer::submit(unsigned seq, int n) {
+    {
+        std::lock_guard<std::mutex> lk(p_->mu);
+        p_->q.push_back({seq, n});
+    }
+    p_->cv.notify_one();
+}
+
+void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
+                    cudaStream_t s, const ArAux& aux) {
+    const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm, n4 = n / 4, NP = ar_host_pieces(), P4 = cdiv(n4, NP);
+    const int fs = a.slots * kArBlocks * 8;
+    uint2* own = (uint2*) scratch;
+    uint2* hrow = (uint2*) hr.row(mi, slot);
+    const uint2* hsum = (const uint2*) hr.sum(slot);
+    ar_to16_kernel<<<std::max(1, std::min(1024, cdiv(n4, kThreads))), kThreads, 0, s>>>((const float4*) x, n4, own);
+    cudaEventRecord(aux.ev[0], s);
+    cudaStreamWaitEvent(aux.s2, aux.ev[0], 0);
+    for (int p = 0; p < NP; ++p) {
+        const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
+        if (p1 > p0) cudaMemcpyAsync(hrow + p0, own + p0, (size_t) (p1 - p0) * 8, cudaMemcpyDeviceToHost, aux.s2);
+        set_flag_kernel<<<1, 1, 0, aux.s2>>>(a.bflags + ((size_t) slot * kArBlocks + p) * 8 + (size_t) mi * fs, seq);
+    }
+    for (int p = 0; p < NP; ++p) {
+        const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
+        wait_flags_kernel<<<1, 32, 0, s>>>(a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8, 1, 0, seq);
+        if (p1 > p0)
+            ar_from16_zc_kernel<<<std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s>>>(
+                (float4*) x, hsum, p1, p1, p1, p0);
+    }
+}
+
 }  // namespace strata::ds4
+
