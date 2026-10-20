@@ -27,6 +27,12 @@ namespace strata::kernels::exl3 {
 /// The weight type the engine's MvJob / WSlot carry for EXL3: their weight pointer is a (host) const Mat*.
 constexpr int kTypeEXL3 = 200;
 
+/// A Mat's format: EXL3 (trellis, suh, svh), or a plain weight the same calls take (mv, view, supported, mv_cols,
+/// reconstruct_rows; src/kernels/cuda/exl3_dense.cu) - stored as a torch Linear's [n][k] row-major at w: FP8 E4M3
+/// codes with a UE8M0 (power of two) scale per 32 x 32 block at sc [n / 32][k / 32] (DeepSeek's own FP8 weights), or
+/// BF16 bits.  k and n multiples of 32.
+constexpr int kFmtEXL3 = 0, kFmtFP8 = 1, kFmtBF16 = 2;
+
 /// One EXL3 matrix, or a column range of one (a view: trellis/svh advanced to its first column, ld the row stride).
 struct Mat {
     const uint32_t* trellis = nullptr;   // device; 4-byte aligned
@@ -36,6 +42,9 @@ struct Mat {
     int K = 0;                           // bits per weight, 1..8
     int cb = 2;                          // codebook: 0 3inst, 1 mcg, 2 mul1
     int ld = 0;                          // tiles per 16-row slice in memory (the full matrix's n / 16); 0: n / 16
+    int fmt = kFmtEXL3;
+    const void* w = nullptr;             // (FP8 / BF16) device [n][k], 16-byte aligned rows
+    const uint8_t* sc = nullptr;         // (FP8) device UE8M0 [n / 32][k / 32]
 };
 
 /// Trellis bytes of a k x n matrix at K bits.

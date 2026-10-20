@@ -208,6 +208,28 @@ float f16_to_f32(uint16_t h) {
     std::memcpy(&f, &u, 4);
     return f;
 }
+uint16_t f32_to_f16(float f) {   // round to nearest even (a BF16 value: exact where F16 holds it)
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const uint32_t s = (u >> 16) & 0x8000u, E = (u >> 23) & 0xffu;
+    uint32_t m = u & 0x7fffffu;
+    const int e = (int) E - 127 + 15;
+    if (E == 0xffu) return (uint16_t) (s | 0x7c00u | (m != 0 ? 0x200u : 0u));
+    if (e >= 31) return (uint16_t) (s | 0x7c00u);
+    if (e <= 0) {   // (an F16 subnormal)
+        if (e < -10) return (uint16_t) s;
+        m |= 0x800000u;
+        const int sh = 14 - e;
+        uint32_t r = m >> sh;
+        const uint32_t rem = m & ((1u << sh) - 1u), half = 1u << (sh - 1);
+        if (rem > half || (rem == half && (r & 1u))) ++r;
+        return (uint16_t) (s | r);
+    }
+    uint32_t r = (uint32_t) e << 10 | (m >> 13);
+    const uint32_t rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1u))) ++r;   // (a carry into the exponent: the next binade, or inf)
+    return (uint16_t) (s | r);
+}
 
 // ------------------------------------------------------------------ the pack
 struct Tensor {
@@ -1108,6 +1130,8 @@ struct Model::Impl {
     // matrix of its own (the rotations' 128-blocks stay whole)
     bool mat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
              bool cols = true, int rot = 0) {
+        if (pk.get(pre + ".trellis") == nullptr && pk.get(pre + ".weight") != nullptr)
+            return dmat(d, pre, m, err, acct, part, np, cols, rot);
         const Tensor* tr = pk.get(pre + ".trellis");
         const Tensor* su = pk.get(pre + ".suh");
         const Tensor* sv = pk.get(pre + ".svh");
@@ -1185,6 +1209,75 @@ struct Model::Impl {
         }
         return true;
     }
+    // a plain weight onto the device (x3::Mat's kFmtFP8 - DeepSeek's FP8 E4M3 [n][k] and its UE8M0 scale per 32 x 32
+    // block, `.scale` - or kFmtBF16): whole, or part `part` of its outputs (cols: rows of the [n][k]) or of its inputs,
+    // of the rows [r0, r0 + nr) when nr > 0 (a group of wo_a's) - a standalone matrix of its own
+    bool dmat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
+              bool cols = true, int rot = 0, int r0 = 0, int nr = 0) {
+        const Tensor* t = pk.get(pre + ".weight");
+        const Tensor* ts = pk.get(pre + ".scale");
+        const bool fp8 = t != nullptr && t->dtype == "F8_E4M3";
+        if (t == nullptr || t->shape.size() != 2 || !(fp8 || t->dtype == "BF16") ||
+            (fp8 && (ts == nullptr || ts->dtype != "F8_E8M0" || ts->shape.size() != 2 ||
+                     ts->shape[0] * 32 != t->shape[0] || ts->shape[1] * 32 != t->shape[1]))) {
+            err = pre + ": not an FP8 E4M3 (with UE8M0 32 x 32 scales) or BF16 matrix in the pack";
+            return false;
+        }
+        const size_t eb = fp8 ? 1 : 2, K = (size_t) t->shape[1];
+        int n = nr > 0 ? nr : (int) t->shape[0];
+        const int R0 = nr > 0 ? r0 : 0;
+        if (nr > 0 && (r0 % 32 != 0 || nr % 32 != 0 || r0 + nr > t->shape[0])) {
+            err = pre + ": rows " + std::to_string(r0) + " + " + std::to_string(nr) + " out of its blocks";
+            return false;
+        }
+        int at = 0, w = cols ? n : (int) K;
+        if (np > 1) {
+            const int whole = cols ? n : (int) K;
+            if (whole % 128 != 0 || whole / 128 < np) {
+                err = pre + ": " + std::to_string(whole) + (cols ? " outputs" : " inputs") + " do not split in " +
+                      std::to_string(np) + " parts of 128-blocks";
+                return false;
+            }
+            split128(whole, np, part, at, w, rot);
+        }
+        const int rows = cols ? w : n, row0 = R0 + (cols ? at : 0), k = cols ? (int) K : w, c0 = cols ? 0 : at;
+        std::vector<uint8_t> raw((size_t) rows * K * eb), sraw(fp8 ? (size_t) (rows / 32) * (K / 32) : 0);
+        if (!pk.read_at(t->file, t->off + (uint64_t) row0 * K * eb, raw.size(), raw.data()) ||
+            (fp8 && !pk.read_at(ts->file, ts->off + (uint64_t) (row0 / 32) * (K / 32), sraw.size(), sraw.data()))) {
+            err = pre + ": read failed";
+            return false;
+        }
+        if (k != (int) K) {   // (the inputs [c0, c0 + k) of each row, and of each scale row)
+            std::vector<uint8_t> a((size_t) rows * k * eb), b(fp8 ? (size_t) (rows / 32) * (k / 32) : 0);
+            for (int r = 0; r < rows; ++r)
+                std::memcpy(a.data() + (size_t) r * k * eb, raw.data() + ((size_t) r * K + c0) * eb, (size_t) k * eb);
+            for (int r = 0; fp8 && r < rows / 32; ++r)
+                std::memcpy(b.data() + (size_t) r * (k / 32), sraw.data() + (size_t) r * (K / 32) + c0 / 32, (size_t) k / 32);
+            raw.swap(a);
+            sraw.swap(b);
+        }
+        m = x3::Mat{};
+        m.fmt = fp8 ? x3::kFmtFP8 : x3::kFmtBF16;
+        m.k = k;
+        m.n = rows;
+        uint8_t *dw = nullptr, *dsc = nullptr;
+        if (!dalloc(d, dw, raw.size(), err, acct) || (fp8 && !dalloc(d, dsc, sraw.size(), err, acct))) return false;
+        cudaSetDevice(d.id);
+        CK(cudaMemcpy(dw, raw.data(), raw.size(), cudaMemcpyHostToDevice));
+        if (fp8) CK(cudaMemcpy(dsc, sraw.data(), sraw.size(), cudaMemcpyHostToDevice));
+        m.w = dw;
+        m.sc = dsc;
+        if (!x3::supported(m)) {
+            err = pre + ": k " + std::to_string(m.k) + " n " + std::to_string(m.n) + " not covered by the plain kernels";
+            return false;
+        }
+        return true;
+    }
+    // wo_a's group gi: a slice of the EXL3 pack's, or rows [gi o_lora, (gi + 1) o_lora) of the plain weight
+    bool wo_a(Dev& d, const std::string& A, int gi, x3::Mat& m, std::string& err, size_t* acct) {
+        if (pk.get(A + "wo_a.weight") != nullptr) return dmat(d, A + "wo_a", m, err, acct, 0, 1, true, 0, gi * g.o_lora, g.o_lora);
+        return mat(d, A + "wo_a.slice." + std::to_string(gi), m, err, acct);
+    }
     // a float tensor (F32 / F16 / BF16) as F32 on the device
     bool f32(Dev& d, const std::string& name, float*& p, std::string& err, size_t* acct, size_t want = 0) {
         const Tensor* t = pk.get(name);
@@ -1221,19 +1314,30 @@ struct Model::Impl {
         CK(cudaMemcpy(p, v.data(), n * 4, cudaMemcpyHostToDevice));
         return true;
     }
+    // an F16 tensor's bits on the device (a BF16 one rounded to F16: the 1.62-bit SAGE pack's router and heads)
     bool f16raw(Dev& d, const std::string& name, uint16_t*& p, std::string& err, size_t* acct) {
         const Tensor* t = pk.get(name);
-        if (t == nullptr || t->dtype != "F16") {
-            err = name + ": not an F16 tensor in the pack";
+        if (t == nullptr || (t->dtype != "F16" && t->dtype != "BF16")) {
+            err = name + ": not an F16 (or BF16) tensor in the pack";
             return false;
         }
         if (!dalloc(d, p, t->bytes / 2, err, acct)) return false;
-        return upload(d, *t, p, err);
+        if (t->dtype == "F16") return upload(d, *t, p, err);
+        std::vector<uint16_t> v(t->bytes / 2);
+        if (!pk.read(*t, v.data())) {
+            err = name + ": read failed";
+            return false;
+        }
+        for (uint16_t& x : v) x = f32_to_f16(bf16_to_f32(x));
+        cudaSetDevice(d.id);
+        CK(cudaMemcpy(p, v.data(), t->bytes, cudaMemcpyHostToDevice));
+        return true;
     }
 
     size_t mat_bytes(const std::string& pre) const {
         size_t b = 0;
-        for (const char* s : {".trellis", ".suh", ".svh"})
+        static const std::vector<const char*> exl3 = {".trellis", ".suh", ".svh"}, plain = {".weight", ".scale"};
+        for (const char* s : pk.get(pre + ".trellis") != nullptr ? exl3 : plain)
             if (const Tensor* t = pk.get(pre + s)) b += align256(t->bytes);
         return b;
     }
@@ -1496,6 +1600,7 @@ struct Model::Impl {
                                   "attn.compressor.wgate", "attn.indexer.wq_b", "attn.indexer.wk", "engram.wkv"})
                 b += mat_bytes(P + m);
             for (int gi = 0; gi < g.o_groups; ++gi) b += mat_bytes(P + "attn.wo_a.slice." + std::to_string(gi));
+            b += mat_bytes(P + "attn.wo_a");   // (a plain weight's: one tensor)
             b += tensor_bytes(P + "hc_attn_fn") + tensor_bytes(P + "hc_ffn_fn") + tensor_bytes(P + "ffn.gate.weight");
             b += (size_t) g.win * g.hd * 2 + (2u << 20);
             l.dense_bytes = b;
@@ -2395,7 +2500,7 @@ struct Model::Impl {
             if (!ok) return false;
             l.sink += (size_t) l.ah0;
             for (int gi = 0; gi < l.ogn; ++gi)
-                if (!mat(d, A + "wo_a.slice." + std::to_string(l.og0 + gi), l.wo_a[gi], err, &sp)) return false;
+                if (!wo_a(d, A, l.og0 + gi, l.wo_a[gi], err, &sp)) return false;
             if (l.kv_src) {
                 const std::string C = A + "compressor.";
                 if (!mat(d, C + "wkv", l.c_wkv, err, acct) || !f32(d, C + "norm.weight", l.c_norm, err, acct)) return false;
@@ -2445,8 +2550,8 @@ struct Model::Impl {
                 const Tensor* th = pk.get("mtp." + std::to_string(g.n_mtp - 1) + ".markov_head.head.weight");
                 const int R = g.d_rank;
                 split128(g.vocab, hn, d.mi, d.mk_v0, d.mk_vn);
-                if (th == nullptr || th->dtype != "F16" || th->bytes != (uint64_t) g.vocab * R * 2) {
-                    err = "the markov head: not an F16 [vocab][rank] matrix";
+                if (th == nullptr || (th->dtype != "F16" && th->dtype != "BF16") || th->bytes != (uint64_t) g.vocab * R * 2) {
+                    err = "the markov head: not an F16 (or BF16) [vocab][rank] matrix";
                     return false;
                 }
                 std::vector<uint16_t> rows((size_t) d.mk_vn * R);
@@ -2454,6 +2559,8 @@ struct Model::Impl {
                     err = "the markov head: read failed";
                     return false;
                 }
+                if (th->dtype == "BF16")
+                    for (uint16_t& x : rows) x = f32_to_f16(bf16_to_f32(x));
                 if (!dalloc(d, d.mk_share, rows.size(), err, acct) || !dalloc(d, d.mk_erow, (size_t) R, err) ||
                     !dalloc(d, d.mk_ints, (size_t) kWin + 2, err))
                     return false;
@@ -2470,8 +2577,8 @@ struct Model::Impl {
                     return false;
                 const Tensor* te = pk.get(Z + "markov_head.embed.weight");
                 const Tensor* th = pk.get(Z + "markov_head.head.weight");
-                if (te == nullptr || th == nullptr || te->dtype != "BF16" || th->dtype != "F16") {
-                    err = Z + "markov_head: not the BF16 embed and F16 head expected";
+                if (te == nullptr || th == nullptr || te->dtype != "BF16" || (th->dtype != "F16" && th->dtype != "BF16")) {
+                    err = Z + "markov_head: not the BF16 embed and F16 (or BF16) head expected";
                     return false;
                 }
                 if (!dalloc(d, d_mk_embed, te->bytes / 2, err, acct) || !upload(d, *te, d_mk_embed, err) ||

@@ -19,6 +19,8 @@
 // prompt path below is this file's on every GPU.
 #include "strata/kernels/exl3.hpp"
 
+#include "exl3_dense.cuh"
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -1338,6 +1340,7 @@ void mv_split(const Mat& m, int sms, int occ, int& S, int& kr, int call_groups =
 }  // namespace
 
 Mat view(const Mat& m, int c0, int nc) {
+    if (m.fmt != kFmtEXL3) return dense::view(m, c0, nc);
     Mat v = m;
     v.ld = m.ld > 0 ? m.ld : m.n / 16;
     v.trellis = m.trellis + (size_t) (c0 / 16) * 8 * m.K;
@@ -1347,6 +1350,7 @@ Mat view(const Mat& m, int c0, int nc) {
 }
 
 bool supported(const Mat& m) {
+    if (m.fmt != kFmtEXL3) return dense::supported(m);
     return m.trellis != nullptr && m.suh != nullptr && m.svh != nullptr && m.k > 0 && m.n > 0 && m.k % 128 == 0 &&
            m.n % 128 == 0 && m.K >= 1 && m.K <= 8 && m.cb >= 0 && m.cb <= 2;
 }
@@ -1355,6 +1359,7 @@ void set_skip(const int* flag) { g_skip = flag; }
 
 int mv_splits(const Mat& m) {
     if (!supported(m)) return 0;
+    if (m.fmt != kFmtEXL3) return 1;
     int S = 1, kr = 0;
     mv_split(m, sm_count(), mv_occ(m.K), S, kr);
     return S;
@@ -1362,6 +1367,7 @@ int mv_splits(const Mat& m) {
 
 int mv_cols(const Mat& m) {
     if (!supported(m)) return 0;
+    if (m.fmt != kFmtEXL3) return dense::kMaxCols;
 #if !defined(STRATA_USE_HIP)
     if (use_legacy()) return 4;   // (v1.1.8's kernels: the runs of four their callers have always used)
 #endif
@@ -1390,8 +1396,20 @@ bool several_ok() {
 }
 
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
-    EXL3_LEGACY(mv(jobs, n, s));
     if (n <= 0 || n > kMaxMvJobs) return false;
+    int nd = 0;   // (the plain weights' jobs: exl3_dense.cu's kernels, then the EXL3 ones here)
+    for (int j = 0; j < n; ++j) nd += jobs[j].m != nullptr && jobs[j].m->fmt != kFmtEXL3;
+    if (nd > 0) {
+        MvJob dj[kMaxMvJobs], ej[kMaxMvJobs];
+        int a = 0, e = 0;
+        for (int j = 0; j < n; ++j) (jobs[j].m->fmt != kFmtEXL3 ? dj[a++] : ej[e++]) = jobs[j];
+        if (!dense::mv(dj, a, s, g_skip)) {
+            g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        return e == 0 || mv(ej, e, s);
+    }
+    EXL3_LEGACY(mv(jobs, n, s));
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
     const int sms = sm_count();
@@ -1691,6 +1709,13 @@ void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, i
 }
 
 void reconstruct_rows(const Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
+    if (m.fmt != kFmtEXL3) {
+        if (!dense::reconstruct_rows(m, dst, bf16, s)) {
+            std::fprintf(stderr, "exl3 reconstruct_rows: unsupported plain matrix\n");
+            g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
     if (!supported(m) || !dispatch<RunRows>(m.K, m.cb, m, dst, bf16, s)) {
         std::fprintf(stderr, "exl3 reconstruct_rows: unsupported matrix\n");
         g_launch_errors.fetch_add(1, std::memory_order_relaxed);

@@ -33,14 +33,15 @@ TEMPLATE = HERE / "chat_template.jinja"
 
 
 def need(st: SafeTensors, t: dict) -> list[str]:
-    """The tensors the engine reads; a missing one stops the pack here instead of the engine's start."""
+    """The tensors the engine reads; a missing one stops the pack here instead of the engine's start.  A matrix is EXL3
+    (.trellis) or a plain weight (.weight: FP8 E4M3 with its .scale, or BF16 - the SAGE packs' dense weights)."""
     miss = []
     for li in range(t["num_hidden_layers"]):
         L = "layers.%d." % li
         for n in ("attn.wq_a.trellis", "attn.wq_b.trellis", "attn.wkv.trellis", "attn.wo_b.trellis",
                   "attn.attn_sink", "attn.q_norm.weight", "attn.kv_norm.weight", "attn_norm.weight", "ffn_norm.weight",
                   "ffn.gate.weight", "ffn.gate.bias", "hc_attn_fn", "hc_ffn_fn", "ffn.shared_experts.w1.trellis"):
-            if not st.has(L + n):
+            if not st.has(L + n) and not (n.endswith(".trellis") and st.has(L + n[:-len("trellis")] + "weight")):
                 miss.append(L + n)
         if li in t["engram_layer_ids"] and not st.has(L + "engram.embed.weight"):
             miss.append(L + "engram.embed.weight (shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017)")
