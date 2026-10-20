@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "strata/kernels/sampler.hpp"
+
 #include <vector>
 
 namespace strata::ds4 {
@@ -106,14 +108,27 @@ struct Rows {
 /// with candidates p = cand[t][i / blk] * blk + i % blk for i < lim.k[t] * blk; positions >= lim.n[t] (or past the
 /// query's candidates) -> -inf.  q rows heads * hd apart, w rows 64, cand rows cand_stride, out rows out_stride.
 /// (keys as BF16 rows of hd, or - k_packed - packed FP4 rows, quant 3, fp4_row_bytes(hd, 3) apart)
+/// With packed keys and DS4_INDEX_TC=1 (and tc) the tensor cores' kernel: the same products, FP32 sums in another order
 void index_score(const float* q, const float* w, const uint16_t* k_bf16, const uint8_t* k_packed, int heads, int hd,
                  int T, int n, const int* cand, int cand_stride, int blk, const Rows& lim, float* out,
-                 long long out_stride, cudaStream_t s);
+                 long long out_stride, cudaStream_t s, bool tc = true);
 /// The top r.k[t] of vals[t][0, r.n[t]) (row t at vals + t * stride): their positions (with candidates
 /// cand[t][i / blk] * blk + i % blk) into out[t][0, k) - those above the k-th value, then of the values equal to it the
 /// first, each run in position order (the same every run).  r.k[t] >= r.n[t] takes them all.
+/// sc (a decode window's rows, T <= sc->T): rows of kTopkSegMin positions or more in segments of ~kTopkSeg, a block
+/// each (their own top k, at most sc->K) and then a block a row over the picks above the segments' largest k-th - the
+/// same picks in the same order, a long row's passes over P blocks instead of one (3 rows: 164 -> 78 us at 64K
+/// positions, 316 -> 88 us at 128K on an RTX 5060 Ti)
+struct TopkScratch {
+    float* val = nullptr;   // [T][P][K]
+    int* idx = nullptr;     // [T][P][K]
+    int* cnt = nullptr;     // [T][P]
+    uint32_t* kth = nullptr;   // [T][P]: each segment's k-th (ordered key)
+    int T = 0, P = 0, K = 0;
+};
+constexpr int kTopkSeg = 16384, kTopkSegMin = 32768, kTopkSegMax = 64;
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
-          int* out, int out_stride, cudaStream_t s);
+          int* out, int out_stride, cudaStream_t s, const TopkScratch* sc = nullptr);
 /// Level one of the candidate pre-filter, row t: block b's score = the max over its blk positions of the r.n[t] the
 /// query sees; the block of its newest position is pinned; the top r.k[t] blocks -> out[t] (bm: scratch rows bm_stride).
 void cand_blocks(const float* score, long long stride, int T, const Rows& r, int blk, float* bm, long long bm_stride,
@@ -125,9 +140,10 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
 struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
     // gen: query t is a chunk's row t0 + t at position p0 + t0 + t (the window buffer: the ring's win rows before p0,
-    // then the chunk's), selecting min(kcap, (its position + 1) / R) compressed rows when R > 0
+    // then the chunk's), selecting min(kcap, (its position + 1) / R) compressed rows when R > 0; its window starts at
+    // position lo or later (0: the whole window - a truncated prompt's consumer layers see only its tail)
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
-    long long p0 = 0;
+    long long p0 = 0, lo = 0;
 };
 void sparse_attn(const float* q, const uint16_t* win, const uint16_t* ckv, const uint8_t* ckv_packed, const int* sel,
                  int sel_stride, const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out,
@@ -238,11 +254,23 @@ void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn
 void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s);
 void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E, uint16_t* erow, int R,
                  cudaStream_t s);
+/// Sampled drafts over a head group: each member its share's top k (<= 64; the sampler's order) into a host-mapped
+/// list {seq, n, n x (ordered value, global index)} (kSpecList unsigneds); every member then all the step's lists ->
+/// the row's top k and sample_draft's chain over it (top_p, min_p, temperature, its Philox draw at c.counter): the
+/// draft into *tok, its E row into erow, and (q non-null: the lead) the kept list - the draft sample_draft would draw
+constexpr int kSpecMembers = 16;
+constexpr size_t kSpecList = 2 + 2 * 64 + 6;   // (a list's unsigneds, 32 B aligned)
+struct SpecChain {
+    int k = 64;
+    float top_p = 1.0f, min_p = 0.0f, temperature = 1.0f;
+    uint64_t seed = 0, counter = 0;
+};
+void topk_share(const float* row, int vn, int v0, int k, unsigned* list, unsigned seq, cudaStream_t s);
+void spec_pick(const unsigned* lists, int nm, size_t stride, unsigned seq, const SpecChain& c, int* tok, const uint16_t* E,
+               uint16_t* erow, int R, strata::kernels::SpecList* q, cudaStream_t s);
 /// The DSpark confidence: out[t] = sigmoid(w . [x[t] | E[tok[t]]]) (x rows dim floats, w F32 [dim + R]).
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s);
-/// Speculative sampling: p[t] = softmax(logits[t] / temp)[draft[t]] for t < n (rows V apart).
-void draft_probs(const float* logits, const int* draft, int n, int V, float temp, float* p, cudaStream_t s);
 
 /// The pipeline's hand-offs and tensor parallelism, through host-mapped memory (these cards copy peer to peer only
 /// through the driver's staging).  xfer_put copies up to 4 segments (any size and alignment: each in 16-byte units

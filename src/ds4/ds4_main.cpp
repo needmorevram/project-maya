@@ -5,7 +5,8 @@
 //   strata-ds4 --pack ... --serve                                       Maya's engine protocol on stdin / stdout
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
-// `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
+// `GEN <max_new> [key=value ...] <id,id,...>` (temperature, top_p, top_k, min_p, seed; draft=greedy|sample: a sampled
+// request's drafts) answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
 // <decode ms> <stop|length|cancel> <accepted> <offered> <reused> <hits> <lookups>` (the drafts; the decode's routed
 // experts in VRAM / all), with `STAT ...` lines (the live expert tiers) every 8 tokens before it, and `INFO` / `VRAM` lines
 // (per GPU: what each part holds) before READY; `STOP` ends a request early, `QUIT` the engine.  A prompt that
@@ -56,7 +57,8 @@ void usage() {
     std::fprintf(stderr,
                  "strata-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
-                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
+                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--prefill-keep exact|off|N]\n"
+                 "           [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
@@ -99,24 +101,104 @@ struct Lines {
     }
 };
 
-// One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
-// confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
-// tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
+// How many drafts a round verifies (DeepInfer's confidence-scheduled verification): the confidence head gives each
+// draft's chance to stand once those before it stood, their running product the chance it is reached and kept, so
+// verifying k drafts is worth 1 + the sum of the first k products in tokens; its cost the drafting plus the window of
+// k + 1, measured - the rounds' wall time by window size (a plain step: 1), a moving average a size.  DS4_DRAFT_COST=1:
+// the k with the most tokens a millisecond (opt-in: at 3.5 bits, --tp 9, the serve protocol's 12 answers 51.9 tok/s
+// against the floor's 53.0 - the CPU lane's noise in the times had it verify more, and keep fewer: 0.60 of the drafts
+// against 0.72 - and the times make a seed's tokens differ run to run); else, and until the times are in, the confidence
+// floor: the drafts up to the first below it.  DS4_DRAFT_STATS=1: the calibration (each confidence bucket's drafts tried
+// and kept) at the end.
+struct DraftPolicy {
+    static constexpr int kMax = 17;
+    double win_ms[kMax] = {};   // a window of T tokens: its round's time after the drafting
+    int win_n[kMax] = {};
+    double draft_ms = 0.0;
+    int draft_n = 0;
+    bool cost = std::getenv("DS4_DRAFT_COST") != nullptr && std::atoi(std::getenv("DS4_DRAFT_COST")) != 0;
+    long long tried[10] = {}, kept[10] = {};   // by the draft's confidence decile: reached, then stood
+    static void avg(double& a, int& n, double x) {
+        a = n == 0 ? x : a + (x - a) / (double) std::min(n + 1, 16);
+        ++n;
+    }
+    // the window of T's time: its own average, else a line through the sizes measured (2 or more)
+    double est(int T) const {
+        if (win_n[T] > 0) return win_ms[T];
+        double sx = 0, sy = 0, sxx = 0, sxy = 0;
+        int n = 0;
+        for (int t = 1; t < kMax; ++t)
+            if (win_n[t] > 0) {
+                sx += t, sy += win_ms[t], sxx += (double) t * t, sxy += t * win_ms[t];
+                ++n;
+            }
+        if (n < 2) return -1.0;
+        const double b = (n * sxy - sx * sy) / std::max(1e-9, n * sxx - sx * sx), a = (sy - b * sx) / n;
+        return a + b * T;
+    }
+    int choose(const std::vector<float>& conf, int cap, float conf_min) const {
+        int floor_k = 0;
+        while (floor_k < cap && conf[(size_t) floor_k] >= conf_min) ++floor_k;
+        if (!cost || draft_n == 0 || win_n[1] == 0 || est(2) < 0) return floor_k;
+        double best = -1.0, cum = 1.0, e = 1.0;
+        int bk = 0;
+        for (int k = 0; k <= cap; ++k) {
+            if (k > 0) {
+                cum *= (double) conf[(size_t) k - 1];
+                e += cum;
+            }
+            const double t = draft_ms + est(k + 1);
+            if (t > 0 && e / t > best) {
+                best = e / t;
+                bk = k;
+            }
+        }
+        return bk;
+    }
+    void kept_stats(const std::vector<float>& conf, int offered, int acc) {
+        for (int i = 0; i < offered && i <= acc; ++i) {   // (draft i reached: those before it stood)
+            const int b = std::min(9, std::max(0, (int) (conf[(size_t) i] * 10.0f)));
+            ++tried[b];
+            kept[b] += i < acc;
+        }
+    }
+    void report() const {
+        std::fprintf(stderr, "dspark calibration (confidence decile: drafts reached, kept):");
+        for (int b = 0; b < 10; ++b)
+            if (tried[b] > 0) std::fprintf(stderr, " [%.1f %lld %.2f]", b / 10.0, tried[b], (double) kept[b] / (double) tried[b]);
+        std::fprintf(stderr, "\ndspark round times (window size: ms, rounds): draft %.2f (%d)", draft_ms, draft_n);
+        for (int t = 1; t < kMax; ++t)
+            if (win_n[t] > 0) std::fprintf(stderr, " %d: %.2f (%d)", t, win_ms[t], win_n[t]);
+        std::fprintf(stderr, "\n");
+    }
+};
+DraftPolicy draft_policy;
+
+// One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts (DraftPolicy's
+// count of them, at most `room` - 1), verified together; else a plain step.  `out` gets the tokens that follow tok
+// (the accepted drafts, then the trunk's next), the last of them the next round's tok.  counter: the draw index of the
+// token after tok (a sampled request's drafts are drawn through its chain - the same the verification gets)
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
            int& accepted, std::string& err) {
     out.clear();
     offered = accepted = 0;
+    DraftPolicy& dp = draft_policy;
+    double t0 = now_ms();
     if (spec && room > 1 && m.draft_block() > 0) {
         std::vector<int> drafts;
         std::vector<float> conf;
-        if (!m.draft(tok, drafts, conf, err)) return false;
-        int keep = 0;
-        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min) ++keep;
+        if (!m.draft(tok, temperature, top_p, top_k, min_p, seed, counter, drafts, conf, err)) return false;
+        const double td = now_ms();
+        DraftPolicy::avg(dp.draft_ms, dp.draft_n, td - t0);
+        t0 = td;
+        const int keep = dp.choose(conf, std::min((int) drafts.size(), room - 1), conf_min);
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
             if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+            DraftPolicy::avg(dp.win_ms[keep + 1], dp.win_n[keep + 1], now_ms() - t0);
+            dp.kept_stats(conf, keep, acc);
             counter += (unsigned long long) acc + 1;
             for (int i = 0; i < acc; ++i) out.push_back(drafts[(size_t) i]);
             out.push_back(next);
@@ -127,6 +209,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     }
     if (!m.step(tok, true, err)) return false;
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
+    DraftPolicy::avg(dp.win_ms[1], dp.win_n[1], now_ms() - t0);
     return true;
 }
 
@@ -135,6 +218,7 @@ struct Req {
     float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int top_k = 64;
     unsigned long long seed = 0;
+    int draft = -1;     // draft=greedy|sample: a sampled request's drafts (-1: the engine's default)
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
 };
@@ -228,6 +312,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "top_k") r.top_k = std::atoi(v.c_str());
         else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
         else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
+        else if (k == "draft") r.draft = v == "sample" ? 1 : v == "greedy" ? 0 : -1;
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -384,6 +469,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
         long long d_off = 0, d_acc = 0;
         bool cool = false;
+        m.set_draft_sample(r.draft);
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
         for (;;) {
@@ -500,6 +586,10 @@ int main(int argc, char** argv) {
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
+        else if (a == "--prefill-keep") {   // a long prompt's consumer layers over its tail: exact, off, or its last N rows
+            const std::string v = val("--prefill-keep");
+            o.prefill_keep = v == "exact" ? 0 : v == "off" ? -1 : std::max(1, std::atoi(v.c_str()));
+        }
         else if (a == "--threads") o.threads = val("--threads") != "off";
         else if (a == "--vision") o.vision = val("--vision") != "off";
         else if (a == "--mmap-experts") {
@@ -644,10 +734,23 @@ int main(int argc, char** argv) {
     // DS4_BENCH_REPEAT=N: the prompt and the decode N times, the state reset between them and the expert cache kept
     // (the later passes measure a warmed cache, as a server's requests run)
     const int reps = std::max(1, std::getenv("DS4_BENCH_REPEAT") ? std::atoi(std::getenv("DS4_BENCH_REPEAT")) : 1);
+    // DS4_KEEP_PASSES=off,exact,140,...: pass i's --prefill-keep (cycled) - the settings side by side in one load
+    std::vector<std::string> keeps;
+    if (const char* kp = std::getenv("DS4_KEEP_PASSES"))
+        for (const char* q = kp; *q;) {
+            const char* e = std::strchr(q, ',');
+            keeps.emplace_back(q, e ? (size_t) (e - q) : std::strlen(q));
+            q = e ? e + 1 : q + std::strlen(q);
+        }
     for (int rep = 0; rep < reps; ++rep) {
     if (rep > 0) {
         m.reset();
         std::fprintf(stderr, "pass %d of %d\n", rep + 1, reps);
+    }
+    if (!keeps.empty()) {
+        const std::string& v = keeps[(size_t) rep % keeps.size()];
+        m.set_prefill_keep(v == "exact" ? 0 : v == "off" ? -1 : std::max(1, std::atoi(v.c_str())));
+        std::fprintf(stderr, "pass %d: --prefill-keep %s\n", rep + 1, v.c_str());
     }
     // (repeated: each pass's logits to a file of its own, <dump>.<pass> - a run's determinism, one load)
     const std::string dpath = reps > 1 ? dump + "." + std::to_string(rep) : dump;
@@ -673,6 +776,15 @@ int main(int argc, char** argv) {
     if (prof_prompt) cudaProfilerStop();
     std::fprintf(stderr, "prompt: %zu tokens in %.0f ms (%.2f tok/s, windows of %d)\n", ids.size(), t1 - t0,
                  1000.0 * (double) ids.size() / (t1 - t0), window);
+    if (const char* dl = std::getenv("DS4_DUMP_LAST")) {   // the prompt's last row of logits, <file>.<pass>
+        std::vector<float> ll;
+        std::FILE* f = m.logits(ll) ? std::fopen((std::string(dl) + "." + std::to_string(rep)).c_str(), "wb") : nullptr;
+        if (f != nullptr) {
+            const size_t V = (size_t) m.vocab();
+            std::fwrite(ll.data() + ll.size() - V, 4, V, f);
+            std::fclose(f);
+        }
+    }
     const strata::ds4::Stats s0 = m.stats();
     std::fprintf(stderr, "prompt's host time: layers %.0f ms, head wait %.0f, Engram waits %.0f, CPU lane %.0f\n",
                  s0.layer_ms - sp.layer_ms, s0.head_ms - sp.head_ms, s0.engram_ms - sp.engram_ms, s0.cpu_ms - sp.cpu_ms);
@@ -711,6 +823,7 @@ int main(int argc, char** argv) {
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
     }
     if (prof && rep == reps - 1) cudaProfilerStop();
+    if (spec && rounds > 0 && std::getenv("DS4_DRAFT_STATS") != nullptr) draft_policy.report();
     if (spec && rounds > 0) {
         const auto& s1 = m.stats();
         const double nv = (double) std::max<int64_t>(1, s1.drafts_rounds - s0.drafts_rounds);

@@ -3,6 +3,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_pool.hpp"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
@@ -524,6 +525,176 @@ __device__ __forceinline__ void rows_at(const Rows& r, int t, int& n, int& k) {
 }
 
 // ---------------------------------------------------------------- the indexer
+// the same scores on the tensor cores (packed FP4 keys, hd 128, at most 32 heads), in integers: a key's 32 values are
+// E2M1 codes times a power of two, and so are a query head's (quant 3) - twice each code an integer of at most 12, so a
+// 32-value block's dot is an exact integer (mma.sync m16n8k32, int8 in, int32 out) times the two powers of two; the
+// four blocks' sums in FP32 (index_score_kernel's FP32 sum of 128 products rounds more than this).  A tile of 128 key
+// slots at a time, QT queries' 32 heads each (the shared rows: 1-6 queries a block; with candidates 1, each query its
+// own rows), relu and the head weights' sum by lanes; a block loops over tiles (the queries converted once)
+template <int QT>
+__global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __restrict__ q, const float* __restrict__ w,
+                                                             const uint8_t* __restrict__ kp, int heads, int n, int T,
+                                                             const int* __restrict__ cand, int cand_stride, int blk,
+                                                             Rows lim, float* __restrict__ out, long long out_stride,
+                                                             int ntiles) {
+    constexpr int HD = 128, KT = 128, LD = HD + 16, NQ = QT * 32, NB = HD / 32, RB = HD / 2 + HD / 32;
+    extern __shared__ __align__(16) int8_t tc_smem[];   // Ks [KT][LD], Qs [NQ][LD] (int8), ek [KT][NB], eq [NQ][NB]
+    int8_t* Ks = tc_smem;
+    int8_t* Qs = Ks + KT * LD;
+    int* ek = (int*) (Qs + NQ * LD);
+    int* eq = ek + KT * NB;
+    __shared__ float ws[NQ];
+    __shared__ int ln_s[QT], lk_s[QT];
+    const int t0 = blockIdx.y * QT;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tg = lane & 3;
+    // the queries to integers: a warp 4 heads of a query at a time, a lane 4 values of each (its loads all at once),
+    // a block's 32 values on 8 lanes (their largest by shuffles: a = m 2^e, m in [0.5, 1) - the block's values times
+    // 2^(4 - e) are integers of at most 12)
+    for (int r0 = warp * 4; r0 < NQ; r0 += (blockDim.x >> 5) * 4) {
+        float4 v[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int r = r0 + u, t = t0 + r / 32, h = r % 32;
+            v[u] = t < T && h < heads ? *(const float4*) (q + ((size_t) t * heads + h) * HD + lane * 4)
+                                      : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            float a = fmaxf(fmaxf(fabsf(v[u].x), fabsf(v[u].y)), fmaxf(fabsf(v[u].z), fabsf(v[u].w)));
+            for (int o = 4; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+            // (a = m 2^e, m in [0.5, 1): e from its exponent bits; 0 for none - and its powers of two exactly)
+            const int e = a > 0.0f ? (int) ((__float_as_uint(a) >> 23) & 0xffu) - 126 : 0;
+            const float sc = __int_as_float((127 + 4 - e) << 23);
+            const uint32_t b0 = (uint8_t) (int8_t) __float2int_rn(v[u].x * sc), b1 = (uint8_t) (int8_t) __float2int_rn(v[u].y * sc),
+                           b2 = (uint8_t) (int8_t) __float2int_rn(v[u].z * sc), b3 = (uint8_t) (int8_t) __float2int_rn(v[u].w * sc);
+            *(uint32_t*) (Qs + (r0 + u) * LD + lane * 4) = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            if ((lane & 7) == 0) eq[(r0 + u) * NB + lane / 8] = e - 4;
+        }
+    }
+    for (int i = threadIdx.x; i < NQ; i += blockDim.x) {
+        const int t = t0 + i / 32, h = i % 32;
+        ws[i] = t < T && h < heads ? w[(size_t) t * 64 + h] : 0.0f;
+    }
+    if ((int) threadIdx.x < QT) {
+        int a = 0, b = 0;
+        if (t0 + (int) threadIdx.x < T) rows_at(lim, t0 + (int) threadIdx.x, a, b);
+        ln_s[threadIdx.x] = a, lk_s[threadIdx.x] = b;
+    }
+    __syncthreads();
+    const int* cd = cand != nullptr ? cand + (size_t) t0 * cand_stride : nullptr;   // (QT 1 with candidates)
+    // slot i's key position for query tq, or -1 (none: -inf)
+    auto pos_of = [&](int i, int tq) -> int {
+        if (i >= n) return -1;
+        int p = i;
+        if (cd != nullptr) {
+            if (i >= lk_s[tq] * blk) return -1;
+            p = cd[i / blk] * blk + i % blk;
+        }
+        return p < ln_s[tq] ? p : -1;
+    };
+    // a tile's rows: a thread 8 words of 8 codes (and their blocks' scale bytes) - fetched a tile ahead, into registers
+    // while the tile before computes, then made integers in Ks (twice the E2M1 values: 0 1 2 3 4 6 8 12, signed)
+    constexpr int NW = KT * (HD / 8) / 256;
+    uint32_t rw[NW], sb[NW];
+    auto fetch = [&](int tile) {
+#pragma unroll
+        for (int u = 0; u < NW; ++u) {
+            const int x = threadIdx.x + u * 256, j = x / (HD / 8), c = (x % (HD / 8)) * 8, i = tile * KT + j;
+            const int p = cd != nullptr ? pos_of(i, 0) : i < n ? i : -1;   // (shared rows: every slot below n)
+            if (p >= 0) {
+                const uint8_t* kr = kp + (size_t) p * RB;
+                rw[u] = *(const uint32_t*) (kr + c / 2);
+                sb[u] = (c & 31) == 0 ? kr[HD / 2 + c / 32] : 0u;
+            } else
+                rw[u] = 0u, sb[u] = 128u;   // (no row: zeros, its blocks' scale 2^0)
+        }
+    };
+    auto stage = [&]() {
+#pragma unroll
+        for (int u = 0; u < NW; ++u) {
+            const int x = threadIdx.x + u * 256, j = x / (HD / 8), c = (x % (HD / 8)) * 8;
+            uint32_t lo = 0u, hi = 0u;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const uint32_t cc = (rw[u] >> (4 * e)) & 15u;
+                const uint32_t v = (uint32_t) (0x0C08060403020100ull >> (8 * (cc & 7u))) & 0xffu;
+                const uint32_t byte = (cc & 8u ? 0u - v : v) & 0xffu;
+                if (e < 4) lo |= byte << (8 * e);
+                else hi |= byte << (8 * (e - 4));
+            }
+            *(uint2*) (Ks + j * LD + c) = make_uint2(lo, hi);
+            if ((c & 31) == 0) ek[j * NB + c / 32] = (int) sb[u] - 128;
+        }
+    };
+    if (blockIdx.x < ntiles) fetch(blockIdx.x);
+    for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+        const int i0 = tile * KT;
+        stage();
+        __syncthreads();
+        if (tile + (int) gridDim.x < ntiles) fetch(tile + gridDim.x);   // (in flight beside the MMAs below)
+        float acc[QT * 4][4];
+#pragma unroll
+        for (int nt = 0; nt < QT * 4; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+        const int ra = warp * 16 + g;   // (this thread's rows: ra and ra + 8)
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const int8_t* kr0 = Ks + ra * LD + b * 32 + tg * 4;
+            const uint32_t a0 = *(const uint32_t*) kr0, a1 = *(const uint32_t*) (kr0 + 8 * LD),
+                           a2 = *(const uint32_t*) (kr0 + 16), a3 = *(const uint32_t*) (kr0 + 8 * LD + 16);
+            const int ea = ek[ra * NB + b], eb = ek[(ra + 8) * NB + b];
+#pragma unroll
+            for (int nt = 0; nt < QT * 4; ++nt) {
+                const int col = nt * 8 + tg * 2;
+                const int8_t* qr = Qs + (nt * 8 + g) * LD + b * 32 + tg * 4;
+                const uint32_t b0 = *(const uint32_t*) qr, b1 = *(const uint32_t*) (qr + 16);
+                int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                             "{%0,%1,%2,%3};\n"
+                             : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                const int q0 = eq[col * NB + b], q1 = eq[(col + 1) * NB + b];
+                acc[nt][0] += (float) c0 * __int_as_float((127 + ea + q0) << 23);
+                acc[nt][1] += (float) c1 * __int_as_float((127 + ea + q1) << 23);
+                acc[nt][2] += (float) c2 * __int_as_float((127 + eb + q0) << 23);
+                acc[nt][3] += (float) c3 * __int_as_float((127 + eb + q1) << 23);
+            }
+        }
+        // rows ra (c0, c1) and ra + 8 (c2, c3); columns nt*8 + tg*2 + {0, 1}: query nt / 4, head (nt % 4)*8 + ..
+#pragma unroll
+        for (int tq = 0; tq < QT; ++tq) {
+            float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const float* wh = ws + tq * 32 + u * 8 + tg * 2;
+                const float* av = acc[tq * 4 + u];
+                s0 += fmaxf(av[0], 0.0f) * wh[0] + fmaxf(av[1], 0.0f) * wh[1];
+                s1 += fmaxf(av[2], 0.0f) * wh[0] + fmaxf(av[3], 0.0f) * wh[1];
+            }
+            s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
+            s0 += __shfl_xor_sync(0xffffffffu, s0, 2);
+            s1 += __shfl_xor_sync(0xffffffffu, s1, 1);
+            s1 += __shfl_xor_sync(0xffffffffu, s1, 2);
+            const int t = t0 + tq;
+            if (tg == 0 && t < T) {
+                float* o = out + (long long) t * out_stride;
+                const int ia = i0 + ra, ib = ia + 8;
+                if (ia < n) o[ia] = pos_of(ia, tq) >= 0 ? s0 : -INFINITY;
+                if (ib < n) o[ib] = pos_of(ib, tq) >= 0 ? s1 : -INFINITY;
+            }
+        }
+        __syncthreads();   // (the next tile's rows over these)
+    }
+}
+template <int QT>
+constexpr size_t index_tc_smem() { return (size_t) (128 + QT * 32) * (128 + 16) + (size_t) (128 + QT * 32) * 4 * 4; }
+template <int QT>
+void index_tc_launch(int gx, int gy, cudaStream_t s, const float* q, const float* w, const uint8_t* kp, int heads, int n,
+                     int T, const int* cand, int cand_stride, int blk, const Rows& lim, float* out, long long out_stride,
+                     int ntiles) {
+    index_score_tc_kernel<QT><<<dim3(gx, gy), 256, index_tc_smem<QT>(), s>>>(q, w, kp, heads, n, T, cand, cand_stride, blk,
+                                                                             lim, out, out_stride, ntiles);
+}
+
 // a thread a position: its key row (BF16) against every head's query (shared memory), relu, weighted sum
 template <int HD>
 __global__ void __launch_bounds__(kThreads) index_score_kernel(const float* __restrict__ q, const float* __restrict__ w,
@@ -606,34 +777,25 @@ __device__ __forceinline__ uint32_t ord_key(float f) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
-// a block a row: the k-th largest key by four 8-bit radix passes, then everything above it and the first of its ties -
-// placed by a block-wide scan in position order (not by atomics: the same rows, in the same order, run after run - the
-// sparse attention sums them in that order)
-__global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ vals, long long stride, Rows r,
-                                                    const int* __restrict__ cand, int cand_stride, int blk,
-                                                    int* __restrict__ out, int out_stride) {
+// a block's selection over a sequence of n keys (key(i)): the k-th largest by four 8-bit radix passes, then everything
+// above it and the first of its ties - placed by a block-wide scan in sequence order (not by atomics: the same rows, in
+// the same order, run after run - the sparse attention sums them in that order).  emit(slot, i) takes pick i to its
+// slot: LAYOUT 0 (the indexer's) the ones above the k-th in order, then its ties in order; LAYOUT 1 the picks as one run
+// in sequence order (a row segment's candidates for topk_merge).  k < n; returns the k-th key
+template <int LAYOUT, class Key, class Emit>
+__device__ __forceinline__ uint32_t topk_block(int n, int k, Key key, Emit emit) {
     __shared__ unsigned hist[256];
     __shared__ uint32_t prefix_s, mask_s;
     __shared__ int remaining_s;
-    __shared__ int warp_gt[32], warp_eq[32];
-    __shared__ int base_gt, base_eq;
-    const int t = blockIdx.x;
-    int n, k;
-    rows_at(r, t, n, k);
-    vals += (long long) t * stride;
-    out += (size_t) t * out_stride;
-    const int* cd = cand != nullptr ? cand + (size_t) t * cand_stride : nullptr;
-    if (n <= 0) return;
-    if (k >= n) {
-        for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
-        return;
-    }
+    __shared__ int warp_gt[32], warp_eq[32], warp_sel[32];
+    __shared__ int base_gt, base_eq, base_sel;
     if (threadIdx.x == 0) {
         prefix_s = 0u;
         mask_s = 0u;
         remaining_s = k;
         base_gt = 0;
         base_eq = 0;
+        base_sel = 0;
     }
     __syncthreads();
     for (int shift = 24; shift >= 0; shift -= 8) {
@@ -641,7 +803,7 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
         __syncthreads();
         const uint32_t prefix = prefix_s, mask = mask_s;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            const uint32_t u = ord_key(vals[i]);
+            const uint32_t u = key(i);
             if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 0xffu], 1u);
         }
         __syncthreads();
@@ -667,7 +829,7 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nw = (int) blockDim.x >> 5;
     for (int i0 = 0; i0 < n; i0 += blockDim.x) {
         const int i = i0 + threadIdx.x;
-        const uint32_t u = i < n ? ord_key(vals[i]) : 0u;
+        const uint32_t u = i < n ? key(i) : 0u;
         const bool gt = i < n && u > thr, eq = i < n && u == thr;
         const unsigned mg = __ballot_sync(0xffffffffu, gt), me = __ballot_sync(0xffffffffu, eq);
         if (lane == 0) {
@@ -685,20 +847,165 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
             te += warp_eq[w];
         }
         const unsigned below = (1u << lane) - 1u;
-        int slot = -1;
-        if (gt) slot = bg + __popc(mg & below);
-        else if (eq) {
-            const int e = be + __popc(me & below);
-            if (e < remaining) slot = n_gt + e;
+        const int e = be + __popc(me & below);   // (this one's place among the ties)
+        if constexpr (LAYOUT == 0) {
+            int slot = -1;
+            if (gt) slot = bg + __popc(mg & below);
+            else if (eq && e < remaining) slot = n_gt + e;
+            if (slot >= 0) emit(slot, i);
+            __syncthreads();
+        } else {
+            const bool sel = gt || (eq && e < remaining);
+            const unsigned ms = __ballot_sync(0xffffffffu, sel);
+            if (lane == 0) warp_sel[wp] = __popc(ms);
+            __syncthreads();
+            int bs = base_sel, ts = 0;
+            for (int w = 0; w < nw; ++w) {
+                if (w < wp) bs += warp_sel[w];
+                ts += warp_sel[w];
+            }
+            if (sel) emit(bs + __popc(ms & below), i);
+            __syncthreads();
+            if (threadIdx.x == 0) base_sel += ts;
         }
-        if (slot >= 0) out[slot] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
-        __syncthreads();
         if (threadIdx.x == 0) {
             base_gt += tg;
             base_eq += te;
         }
         __syncthreads();
     }
+    return thr;
+}
+
+// a block a row: topk_block over the row
+__global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ vals, long long stride, Rows r,
+                                                    const int* __restrict__ cand, int cand_stride, int blk,
+                                                    int* __restrict__ out, int out_stride) {
+    const int t = blockIdx.x;
+    int n, k;
+    rows_at(r, t, n, k);
+    vals += (long long) t * stride;
+    out += (size_t) t * out_stride;
+    const int* cd = cand != nullptr ? cand + (size_t) t * cand_stride : nullptr;
+    if (n <= 0) return;
+    if (k >= n) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
+        return;
+    }
+    topk_block<0>(n, k, [&](int i) { return ord_key(vals[i]); },
+                  [&](int slot, int i) { out[slot] = cd != nullptr ? cd[i / blk] * blk + i % blk : i; });
+}
+
+// a few rows of many positions (a decode window's): each row in P segments, a block each - its own top k, in position
+// order (every one of the row's picks in it is among them: fewer than k of the row's lie above the row's k-th value,
+// and its ties there are the segment's first) - then a block a row over the segments' runs, in position order too: the
+// picks and the order topk_kernel gives, a row's passes spread over P blocks instead of one
+__global__ void __launch_bounds__(1024) topk_seg_kernel(const float* __restrict__ vals, long long stride, Rows r, int P,
+                                                        int K, float* __restrict__ sv, int* __restrict__ si,
+                                                        int* __restrict__ sn, uint32_t* __restrict__ sk) {
+    const int p = blockIdx.x, t = blockIdx.y;
+    int n, k;
+    rows_at(r, t, n, k);
+    if (n <= 0 || k >= n) return;   // (the merge takes the whole row)
+    vals += (long long) t * stride;
+    const int S = (n + P - 1) / P, lo = p * S, ns = max(0, min(n, lo + S) - lo);
+    float* cv = sv + ((size_t) t * P + p) * K;
+    int* ci = si + ((size_t) t * P + p) * K;
+    if (ns <= k) {   // (all of it: no floor)
+        for (int i = threadIdx.x; i < ns; i += blockDim.x) cv[i] = vals[lo + i], ci[i] = lo + i;
+        if (threadIdx.x == 0) sn[t * P + p] = ns, sk[t * P + p] = 0u;
+        return;
+    }
+    const uint32_t kth = topk_block<1>(ns, k, [&](int i) { return ord_key(vals[lo + i]); },
+                                       [&](int slot, int i) { cv[slot] = vals[lo + i], ci[slot] = lo + i; });
+    if (threadIdx.x == 0) sn[t * P + p] = k, sk[t * P + p] = kth;   // (the row's k-th is at least the segment's)
+}
+// the merge: only the segments' picks at or above the largest segment's k-th (the row's k-th is at least that) - into
+// shared memory in position order, then topk_block over them (all of the candidates when more than kMergeCap pass: with
+// 16K-position segments ~3% of a row pass, 8192 of them past 256K positions)
+constexpr int kMergeCap = 8192;
+__global__ void __launch_bounds__(1024) topk_merge_kernel(Rows r, int P, int K, const float* __restrict__ sv,
+                                                          const int* __restrict__ si, const int* __restrict__ sn,
+                                                          const uint32_t* __restrict__ sk, const int* __restrict__ cand,
+                                                          int cand_stride, int blk, int* __restrict__ out,
+                                                          int out_stride) {
+    __shared__ int off[kTopkSegMax + 1];
+    __shared__ uint32_t floor_s;
+    extern __shared__ __align__(16) uint8_t merge_smem[];   // [kMergeCap] values, then [kMergeCap] positions
+    float* mv = (float*) merge_smem;
+    int* mi = (int*) (merge_smem + (size_t) kMergeCap * 4);
+    __shared__ int warp_n[32], base_n;
+    const int t = blockIdx.x;
+    int n, k;
+    rows_at(r, t, n, k);
+    out += (size_t) t * out_stride;
+    const int* cd = cand != nullptr ? cand + (size_t) t * cand_stride : nullptr;
+    if (n <= 0) return;
+    if (k >= n) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
+        return;
+    }
+    if (threadIdx.x == 0) {
+        off[0] = 0;
+        uint32_t f = 0u;
+        for (int p = 0; p < P; ++p) {
+            off[p + 1] = off[p] + sn[t * P + p];
+            f = max(f, sk[t * P + p]);
+        }
+        floor_s = f;
+        base_n = 0;
+    }
+    __syncthreads();
+    const float* cv = sv + (size_t) t * P * K;
+    const int* ci = si + (size_t) t * P * K;
+    const uint32_t fl = floor_s;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nw = (int) blockDim.x >> 5;
+    bool fits = true;
+    for (int p = 0; p < P && fits; ++p) {   // (each segment's run in order, the passing ones packed in order)
+        const int c = off[p + 1] - off[p];
+        for (int j0 = 0; j0 < c; j0 += blockDim.x) {
+            const int j = j0 + threadIdx.x;
+            const float x = j < c ? cv[(size_t) p * K + j] : 0.0f;
+            const bool keep = j < c && ord_key(x) >= fl;
+            const unsigned m = __ballot_sync(0xffffffffu, keep);
+            if (lane == 0) warp_n[wp] = __popc(m);
+            __syncthreads();
+            int b = base_n, tot = 0;
+            for (int w = 0; w < nw; ++w) {
+                if (w < wp) b += warp_n[w];
+                tot += warp_n[w];
+            }
+            const int at = b + __popc(m & ((1u << lane) - 1u));
+            if (keep && at < kMergeCap) mv[at] = x, mi[at] = ci[(size_t) p * K + j];
+            __syncthreads();
+            if (threadIdx.x == 0) base_n += tot;
+            __syncthreads();
+            if (base_n > kMergeCap) {
+                fits = false;
+                break;
+            }
+        }
+    }
+    if (fits) {
+        topk_block<0>(base_n, k, [&](int i) { return ord_key(mv[i]); }, [&](int slot, int i) {
+            const int x = mi[i];
+            out[slot] = cd != nullptr ? cd[x / blk] * blk + x % blk : x;
+        });
+        return;
+    }
+    auto at = [&](int i) {   // (all of them: candidate i in segment p's run, from off[p])
+        int lo = 0, hi = P;
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) >> 1;
+            if (off[mid] <= i) lo = mid;
+            else hi = mid;
+        }
+        return (size_t) lo * K + (i - off[lo]);
+    };
+    topk_block<0>(off[P], k, [&](int i) { return ord_key(cv[at(i)]); }, [&](int slot, int i) {
+        const int x = ci[at(i)];
+        out[slot] = cd != nullptr ? cd[x / blk] * blk + x % blk : x;
+    });
 }
 
 __global__ void block_max_kernel(const float* __restrict__ score, long long stride, Rows r, int blk,
@@ -732,7 +1039,8 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __re
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);   // the window buffer row of max(0, pa - win + 1)
+        // the window buffer row of max(0, lo, pa - win + 1) (lo: the run's floor, a truncated prompt's tail)
+        const long long first = max((long long) ar.win - ar.p0 + ar.lo, ta + 1);
         w0 = (int) first;
         n_win = (int) (ar.win + ta - first + 1);
         n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
@@ -865,7 +1173,7 @@ __global__ void __launch_bounds__(HG * 32) sparse_attn_hg_kernel(const float* __
     int n_win, n_sel, w0;
     if (ar.gen) {
         const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        const long long first = max((long long) ar.win - ar.p0 + ar.lo, ta + 1);
         w0 = (int) first;
         n_win = (int) (ar.win + ta - first + 1);
         n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
@@ -1129,23 +1437,332 @@ __global__ void __launch_bounds__(1024) argmax_share_kernel(const float* __restr
 __global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E,
                                    uint16_t* erow, int R) {
     __shared__ int pick;
-    if ((int) threadIdx.x < nm)
+    __shared__ float sv[256];
+    __shared__ int si[256];
+    if ((int) threadIdx.x < nm) {   // (each member's slot read by a thread of its own: host memory, a PCIe round trip each)
         while ((int) (*(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4 + 2) - seq) < 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             __nanosleep(32);
 #endif
         }
+        sv[threadIdx.x] = __uint_as_float(*(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4));
+        si[threadIdx.x] = (int) *(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4 + 1);
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
         float bv = __int_as_float(0xff800000);
         int bi = 0x7fffffff;
         for (int m = 0; m < nm; ++m) {   // (members in vocabulary order: a tie keeps the lower index)
-            const float v = __uint_as_float(*(volatile const unsigned*) (slots + (size_t) m * 4));
-            const int i = (int) *(volatile const unsigned*) (slots + (size_t) m * 4 + 1);
+            const float v = sv[m];
+            const int i = si[m];
             if (v > bv || (v == bv && i < bi)) bv = v, bi = i;
         }
         pick = bi;
         *tok = bi;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < R; i += blockDim.x) erow[i] = __ldcv(E + (size_t) pick * R + i);
+}
+
+// ---------------------------------------------------------------- sampled drafts over a head group (spec_pick)
+// a share's top k (k <= 64) of a logits row -> a host-mapped list {seq, n, then n x (ordered value, global index)}:
+// the sampler's order (the larger value, on a tie the lower index)
+__device__ __forceinline__ unsigned spec_ord(float x) {   // (sampler.cu's ordered(): NaN lowest, -0 as +0)
+    unsigned b = __float_as_uint(x);
+    if ((b & 0x7fffffffu) > 0x7f800000u) return 0u;
+    if (b == 0x80000000u) b = 0u;
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+__global__ void __launch_bounds__(1024) topk_share_kernel(const float* __restrict__ row, int vn, int v0, int k,
+                                                          unsigned* list, unsigned seq) {
+    constexpr int kBins = 2048, kCap = 1024;   // (the ordered value's top 11 bits; the candidates the fast path ranks)
+    __shared__ unsigned pool[kBins + 1024];    // the coarse histogram, then the candidates (values, then indices)
+    __shared__ unsigned hist[256], cu[64], scan[1024];
+    __shared__ int ci[64];
+    __shared__ unsigned sh_prefix, sh_rem, sh_n, sh_nc, sh_base;
+    __shared__ int sh_bin;
+    if (k > vn) k = vn;
+    // the fast path (sampler.cu's): the coarse bin holding the k-th largest, every value in it or above ranked in shared
+    // memory when they fit (a share's top values seldom crowd one bin past kCap)
+    for (int b = threadIdx.x; b < kBins; b += blockDim.x) pool[b] = 0u;
+    if (threadIdx.x == 0) sh_nc = 0u, sh_base = 0u;
+    __syncthreads();
+    for (int v = threadIdx.x; v < vn; v += blockDim.x) atomicAdd(&pool[spec_ord(row[v]) >> 21], 1u);
+    __syncthreads();
+    {   // suffix counts over the bins, from the top (2 bins a thread)
+        const int nt = (int) blockDim.x, per = (kBins + nt - 1) / nt, b_hi = kBins - 1 - (int) threadIdx.x * per;
+        unsigned mine = 0u;
+        for (int j = 0; j < per && b_hi - j >= 0; ++j) mine += pool[b_hi - j];
+        scan[threadIdx.x] = mine;
+        __syncthreads();
+        for (int off = 1; off < nt; off <<= 1) {
+            const unsigned add = (int) threadIdx.x >= off ? scan[threadIdx.x - off] : 0u;
+            __syncthreads();
+            scan[threadIdx.x] += add;
+            __syncthreads();
+        }
+        unsigned above = scan[threadIdx.x] - mine;
+        if (above < (unsigned) k && above + mine >= (unsigned) k)
+            for (int j = 0; j < per && b_hi - j >= 0; ++j) {
+                above += pool[b_hi - j];
+                if (above >= (unsigned) k) {
+                    sh_bin = b_hi - j;
+                    sh_base = above;   // (the values in that bin and above)
+                    break;
+                }
+            }
+        __syncthreads();
+    }
+    if (sh_base <= (unsigned) kCap) {
+        const int bin = sh_bin;
+        unsigned* cv = pool;
+        int* cix = (int*) pool + kCap;
+        __syncthreads();
+        for (int v = threadIdx.x; v < vn; v += blockDim.x) {
+            const unsigned u = spec_ord(row[v]);
+            if ((int) (u >> 21) >= bin) {
+                const unsigned at = atomicAdd(&sh_nc, 1u);
+                if (at < (unsigned) kCap) cv[at] = u, cix[at] = v;
+            }
+        }
+        __syncthreads();
+        const int nc = (int) min(sh_nc, (unsigned) kCap);
+        for (int i = threadIdx.x; i < nc; i += blockDim.x) {
+            const unsigned ui = cv[i];
+            const int ii = cix[i];
+            int r = 0;
+            for (int j = 0; j < nc && r < k; ++j) r += cv[j] > ui || (cv[j] == ui && cix[j] < ii);
+            if (r < k) {
+                list[2 + 2 * r] = ui;
+                list[3 + 2 * r] = (unsigned) (v0 + ii);
+            }
+        }
+    } else {
+        // the exact radix select of the k-th largest (4 byte passes), everything above it and the lowest-indexed of its
+        // ties, then a rank sort
+        if (threadIdx.x == 0) {
+            sh_prefix = 0u;
+            sh_rem = (unsigned) k;
+            sh_n = 0u;
+        }
+        unsigned mask = 0u;
+        for (int pass = 0; pass < 4; ++pass) {
+            const int shift = 24 - 8 * pass;
+            for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0u;
+            __syncthreads();
+            const unsigned prefix = sh_prefix;
+            for (int v = threadIdx.x; v < vn; v += blockDim.x) {
+                const unsigned u = spec_ord(row[v]);
+                if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255u], 1u);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                unsigned cum = 0u, rem = sh_rem;
+                int d = 255;
+                for (; d > 0; --d) {
+                    if (cum + hist[d] >= rem) break;
+                    cum += hist[d];
+                }
+                sh_rem = rem - cum;
+                sh_prefix = prefix | ((unsigned) d << shift);
+            }
+            mask |= 255u << shift;
+            __syncthreads();
+        }
+        const unsigned T = sh_prefix, need = sh_rem;
+        for (int v = threadIdx.x; v < vn; v += blockDim.x) {
+            const unsigned u = spec_ord(row[v]);
+            if (u > T) {
+                const unsigned at = atomicAdd(&sh_n, 1u);
+                if (at < 64u) cu[at] = u, ci[at] = v;
+            }
+        }
+        __syncthreads();
+        {   // its ties in index order: each thread a contiguous range, an inclusive scan orders the ranges
+            const unsigned base = sh_n;
+            const int nt = (int) blockDim.x, per = (vn + nt - 1) / nt, lo = (int) threadIdx.x * per, hi = min(vn, lo + per);
+            unsigned mine = 0u;
+            for (int v = lo; v < hi; ++v) mine += spec_ord(row[v]) == T;
+            scan[threadIdx.x] = mine;
+            __syncthreads();
+            for (int off = 1; off < nt; off <<= 1) {
+                const unsigned add = (int) threadIdx.x >= off ? scan[threadIdx.x - off] : 0u;
+                __syncthreads();
+                scan[threadIdx.x] += add;
+                __syncthreads();
+            }
+            unsigned rank = scan[threadIdx.x] - mine;
+            for (int v = lo; v < hi && rank < need; ++v)
+                if (spec_ord(row[v]) == T) {
+                    if (base + rank < 64u) cu[base + rank] = T, ci[base + rank] = v;
+                    ++rank;
+                }
+        }
+        __syncthreads();
+        if ((int) threadIdx.x < k) {   // (the order: rank by the composite key)
+            const unsigned ui = cu[threadIdx.x];
+            const int ii = ci[threadIdx.x];
+            int r = 0;
+            for (int j = 0; j < k; ++j) r += cu[j] > ui || (cu[j] == ui && ci[j] < ii);
+            list[2 + 2 * r] = ui;
+            list[3 + 2 * r] = (unsigned) (v0 + ii);
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        list[1] = (unsigned) k;
+        __threadfence_system();
+        *(volatile unsigned*) list = seq;
+    }
+}
+// Philox 4x32-10 and the draft stream's key: sampler.cu's (src/kernels/cuda/sampler.cu), so a draft drawn here is the
+// one sample_draft draws from the same row
+__device__ __forceinline__ float spec_philox(uint64_t seed, uint64_t counter) {
+    uint32_t c0 = (uint32_t) counter, c1 = (uint32_t) (counter >> 32), c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
+    for (int i = 0; i < 10; ++i) {
+        const uint32_t hi0 = __umulhi(0x9E3779B9u, c0), hi1 = __umulhi(0xBB67AE85u, c2);
+        const uint32_t lo0 = 0x9E3779B9u * c0, lo1 = 0xBB67AE85u * c2;
+        const uint32_t n0 = hi1 ^ c1 ^ (uint32_t) i, n2 = hi0 ^ c3;
+        c0 = n0, c1 = lo1, c2 = n2, c3 = lo0;
+    }
+    return (float) (c0 >> 8) * (1.0f / 16777216.0f);
+}
+constexpr uint64_t kSpecDraftKey = 0x5bd1e9955bd1e995ull;
+// every member's list of the step (lists `stride` apart) -> the row's top k, then sample_draft's chain over it (top_p,
+// min_p, temperature in double, one Philox draw): the draft into *tok and its E row (host-mapped BF16 [V][R]) into erow,
+// and (q non-null) the kept list
+__global__ void __launch_bounds__(1024) spec_pick_kernel(const unsigned* lists, int nm, size_t stride, unsigned seq,
+                                                         SpecChain c, int* tok, const uint16_t* E, uint16_t* erow, int R,
+                                                         strata::kernels::SpecList* q) {
+    __shared__ unsigned raw[kSpecMembers * kSpecList];   // (the step's lists, read from host memory in one go)
+    __shared__ int sel_ids[64];
+    __shared__ float sel_logit[64];
+    __shared__ int pick, n_all, at[kSpecMembers + 1];
+    if ((int) threadIdx.x < nm)
+        while ((int) (*(volatile const unsigned*) (lists + (size_t) threadIdx.x * stride) - seq) < 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(32);
+#endif
+        }
+    __syncthreads();
+    // every list at once, 16 bytes a read (each read of host memory a PCIe request: a word at a time, and a list's
+    // count before its entries, they were most of a step)
+    {
+        const uint4* src = (const uint4*) lists;
+        uint4* dst = (uint4*) raw;
+        const int per = (int) (kSpecList / 4), sper = (int) (stride / 4);
+        for (int i = threadIdx.x; i < nm * per; i += blockDim.x) dst[i] = __ldcv(src + (size_t) (i / per) * sper + i % per);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int n = 0;
+        for (int m = 0; m < nm; ++m) {
+            at[m] = n;
+            n += (int) raw[m * kSpecList + 1];
+        }
+        at[nm] = n;
+        n_all = n;
+    }
+    __syncthreads();
+    const int k = min(c.k, n_all);
+    // the global top k: each entry's rank its place in its own list (descending) plus, in every other list, how many
+    // come before it (a binary search: the lists are in the sampler's order, the indices distinct)
+    for (int i = threadIdx.x; i < n_all; i += blockDim.x) {
+        int m = 0;
+        while (m + 1 < nm && at[m + 1] <= i) ++m;
+        const int j = i - at[m];
+        const unsigned ui = raw[m * kSpecList + 2 + 2 * j];
+        const int ii = (int) raw[m * kSpecList + 3 + 2 * j];
+        int r = j;
+        for (int o = 0; o < nm && r < k; ++o) {
+            if (o == m) continue;
+            const unsigned* l = raw + o * kSpecList + 2;
+            int lo = 0, hi = at[o + 1] - at[o];   // (the first of list o not before entry i)
+            while (lo < hi) {
+                const int mid = (lo + hi) >> 1;
+                const unsigned um = l[2 * mid];
+                const int im = (int) l[2 * mid + 1];
+                if (um > ui || (um == ui && im < ii)) lo = mid + 1;
+                else hi = mid;
+            }
+            r += lo;
+        }
+        if (r < k) {
+            sel_ids[r] = ii;
+            const unsigned bb = (ui & 0x80000000u) ? (ui & 0x7fffffffu) : ~ui;   // (spec_ord's inverse)
+            sel_logit[r] = __uint_as_float(bb);
+        }
+    }
+    __syncthreads();
+    // sampler.cu's chain, MODE 1 (sample_draft) - its serial sums in its order (the same bits), the exponentials and
+    // divisions a thread an entry (double precision runs at 1/64 rate on these cards: ~130 of them in one thread were
+    // most of a draft's step)
+    __shared__ double ex[64];
+    __shared__ int n_keep_s;
+    __shared__ double sum_s;
+    const float inv_t = c.temperature > 0.0f ? 1.0f / c.temperature : 0.0f;
+    const float mx = sel_logit[0];   // (descending: the first is the largest)
+    if (threadIdx.x == 0) n_keep_s = k;
+    if (c.top_p < 1.0f) {
+        if ((int) threadIdx.x < k) ex[threadIdx.x] = exp((double) sel_logit[threadIdx.x] - (double) mx);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            double sum = 0.0;
+            for (int i = 0; i < k; ++i) sum += ex[i];
+            double cum = 0.0;
+            int cut = k;
+            for (int i = 0; i < k; ++i) {
+                cum += ex[i] / sum;
+                if (cum >= (double) c.top_p) {
+                    cut = i + 1;
+                    break;
+                }
+            }
+            n_keep_s = cut < 1 ? 1 : cut;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && c.min_p > 0.0f) {
+        const float thresh = sel_logit[0] + logf(c.min_p);
+        for (int i = 0; i < n_keep_s; ++i)
+            if (sel_logit[i] < thresh) {
+                n_keep_s = i;
+                break;
+            }
+    }
+    __syncthreads();
+    const int n_keep = n_keep_s;
+    const float smx = sel_logit[0] * inv_t;
+    if ((int) threadIdx.x < n_keep) ex[threadIdx.x] = exp((double) (sel_logit[threadIdx.x] * inv_t) - (double) smx);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        double sum = 0.0;
+        for (int i = 0; i < n_keep; ++i) sum += ex[i];
+        sum_s = sum;
+    }
+    __syncthreads();
+    if ((int) threadIdx.x < n_keep) {
+        ex[threadIdx.x] /= sum_s;
+        if (q != nullptr) {
+            q->ids[threadIdx.x] = sel_ids[threadIdx.x];
+            q->p[threadIdx.x] = ex[threadIdx.x];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const float u = spec_philox(c.seed ^ kSpecDraftKey, c.counter);
+        double cum = 0.0;
+        int pk = sel_ids[n_keep - 1];
+        for (int i = 0; i < n_keep; ++i) {
+            cum += ex[i];
+            if ((double) u < cum) {
+                pk = sel_ids[i];
+                break;
+            }
+        }
+        if (q != nullptr) q->n = n_keep;
+        pick = pk;
+        *tok = pk;
     }
     __syncthreads();
     for (int i = threadIdx.x; i < R; i += blockDim.x) erow[i] = __ldcv(E + (size_t) pick * R + i);
@@ -1161,31 +1778,6 @@ __global__ void __launch_bounds__(1024) confidence_kernel(const float* __restric
     for (int i = threadIdx.x; i < dim + R; i += blockDim.x) a += w[i] * (i < dim ? xt[i] : bf16f(er[i - dim]));
     a = block_sum(a);
     if (threadIdx.x == 0) out[t] = 1.0f / (1.0f + expf(-a));
-}
-
-__global__ void __launch_bounds__(1024) draft_probs_kernel(const float* __restrict__ logits,
-                                                           const int* __restrict__ draft, int V, float temp,
-                                                           float* __restrict__ p) {
-    const int t = blockIdx.x;
-    const float* z = logits + (size_t) t * V;
-    __shared__ float red[32];
-    float m = -INFINITY;
-    for (int i = threadIdx.x; i < V; i += blockDim.x) m = fmaxf(m, z[i]);
-    m = warp_max(m);
-    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : -INFINITY;
-        v = warp_max(v);
-        if (threadIdx.x == 0) red[0] = v;
-    }
-    __syncthreads();
-    m = red[0];
-    __syncthreads();
-    float s = 0.0f;
-    for (int i = threadIdx.x; i < V; i += blockDim.x) s += expf((z[i] - m) / temp);
-    s = block_sum(s);
-    if (threadIdx.x == 0) p[t] = expf((z[draft[t]] - m) / temp) / s;
 }
 
 // ---------------------------------------------------------------- engram
@@ -1807,12 +2399,43 @@ void compress_win(const float* kv, const float* score, float* kv_state, float* s
 
 void index_score(const float* q, const float* w, const uint16_t* k_bf16, const uint8_t* k_packed, int heads, int hd,
                  int T, int n, const int* cand, int cand_stride, int blk, const Rows& lim, float* out,
-                 long long out_stride, cudaStream_t s) {
+                 long long out_stride, cudaStream_t s, bool tc) {
     if (hd != 128 || heads > 32) {
         std::fprintf(stderr, "ds4 index_score: %d heads of %d not covered\n", heads, hd);
         return;
     }
     if (n <= 0) return;
+    // (opt-in, DS4_INDEX_TC=1: its sums differ from the CUDA cores' in the last bits - perplexity the same, 7.5366 on
+    // 4 x 1024 tokens, but a long greedy run's tokens part after a while)
+    static const bool tc_ok = std::getenv("DS4_INDEX_TC") != nullptr && std::atoi(std::getenv("DS4_INDEX_TC")) != 0;
+    if (tc && tc_ok && k_packed != nullptr) {   // (the tensor cores: a block a tile, looping, ~2 blocks an SM)
+        static std::atomic<uint64_t> opted{0};
+        static int sms[64] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (!(opted.load(std::memory_order_relaxed) >> dev & 1u)) {
+            cudaFuncSetAttribute(index_score_tc_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<1>());
+            cudaFuncSetAttribute(index_score_tc_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<2>());
+            cudaFuncSetAttribute(index_score_tc_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<3>());
+            cudaFuncSetAttribute(index_score_tc_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<4>());
+            cudaFuncSetAttribute(index_score_tc_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<5>());
+            cudaFuncSetAttribute(index_score_tc_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<6>());
+            cudaDeviceGetAttribute(&sms[dev & 63], cudaDevAttrMultiProcessorCount, dev);
+            opted.fetch_or(1ull << dev);
+        }
+        // queries a block: 1 with candidates (each its own rows); else a decode window's all (up to 6), a slab's 4
+        const int qt = cand != nullptr ? 1 : T <= 6 ? T : 4, qg = (T + qt - 1) / qt, ntiles = (n + 127) / 128;
+        const int gx = std::max(1, std::min(ntiles, 2 * sms[dev & 63] / qg));
+        switch (qt) {
+        case 1: index_tc_launch<1>(gx, qg, s, q, w, k_packed, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        case 2: index_tc_launch<2>(gx, qg, s, q, w, k_packed, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        case 3: index_tc_launch<3>(gx, qg, s, q, w, k_packed, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        case 5: index_tc_launch<5>(gx, qg, s, q, w, k_packed, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        case 6: index_tc_launch<6>(gx, qg, s, q, w, k_packed, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        default: index_tc_launch<4>(gx, qg, s, q, w, k_packed, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        }
+        return;
+    }
     const size_t smem = (size_t) (heads * hd + heads) * sizeof(float);
     index_score_kernel<128><<<dim3(cdiv(n, kThreads), T), kThreads, smem, s>>>(q, w, k_bf16, k_packed, heads, n, cand,
                                                                                 cand_stride, blk, lim, out,
@@ -1820,7 +2443,38 @@ void index_score(const float* q, const float* w, const uint16_t* k_bf16, const u
 }
 
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
-          int* out, int out_stride, cudaStream_t s) {
+          int* out, int out_stride, cudaStream_t s, const TopkScratch* sc) {
+    if (sc != nullptr && T <= sc->T) {   // (a few long rows: spread over segments)
+        int nmax = 0, kmax = 0;
+        for (int t = 0; t < T; ++t) {
+            int n = 0, k = 0;
+            if (r.gen == 0) n = r.n[t], k = r.k[t];
+            else {
+                const int nn = (int) ((r.p0 + t + 1) / r.R), cb = std::min(r.ccap, (nn + r.blk - 1) / r.blk);
+                switch (r.gen) {
+                case 1: n = nn, k = std::min(r.kcap, nn); break;
+                case 2: n = nn, k = cb; break;
+                case 3: n = cb * r.blk, k = std::min(r.kcap, nn); break;
+                default: n = (nn + r.blk - 1) / r.blk, k = r.kcap; break;
+                }
+            }
+            nmax = std::max(nmax, n), kmax = std::max(kmax, k);
+        }
+        if (nmax >= kTopkSegMin && kmax <= sc->K) {
+            const int P = std::min(sc->P, std::max(2, (nmax + kTopkSeg - 1) / kTopkSeg));
+            topk_seg_kernel<<<dim3(P, T), 1024, 0, s>>>(vals, stride, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth);
+            static std::atomic<uint64_t> big_smem{0};   // (the devices the merge's shared memory was opted in on)
+            int dev = 0;
+            cudaGetDevice(&dev);
+            if (!(big_smem.load(std::memory_order_relaxed) >> dev & 1u)) {
+                cudaFuncSetAttribute(topk_merge_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMergeCap * 8);
+                big_smem.fetch_or(1ull << dev);
+            }
+            topk_merge_kernel<<<T, 1024, (size_t) kMergeCap * 8, s>>>(r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth, cand,
+                                                                      cand_stride, blk, out, out_stride);
+            return;
+        }
+    }
     topk_kernel<<<T, 1024, 0, s>>>(vals, stride, r, cand, cand_stride, blk, out, out_stride);
 }
 
@@ -1914,14 +2568,17 @@ void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const ui
                  cudaStream_t s) {
     markov_pick_kernel<<<1, 256, 0, s>>>(slots, nm, seq, tok, E, erow, R);
 }
+void topk_share(const float* row, int vn, int v0, int k, unsigned* list, unsigned seq, cudaStream_t s) {
+    topk_share_kernel<<<1, 1024, 0, s>>>(row, vn, v0, std::min(64, std::max(1, k)), list, seq);
+}
+void spec_pick(const unsigned* lists, int nm, size_t stride, unsigned seq, const SpecChain& c, int* tok, const uint16_t* E,
+               uint16_t* erow, int R, strata::kernels::SpecList* q, cudaStream_t s) {
+    spec_pick_kernel<<<1, 1024, 0, s>>>(lists, nm, stride, seq, c, tok, E, erow, R, q);
+}
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s) {
     confidence_kernel<<<T, 1024, 0, s>>>(x, E, tok, w, dim, R, out);
 }
-void draft_probs(const float* logits, const int* draft, int n, int V, float temp, float* p, cudaStream_t s) {
-    if (n > 0) draft_probs_kernel<<<n, 1024, 0, s>>>(logits, draft, V, temp, p);
-}
-
 void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s) {
     engram_dequant_kernel<<<n, kThreads, 0, s>>>(rows, scales, hd, out);
 }

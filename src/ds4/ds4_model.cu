@@ -457,6 +457,7 @@ struct Dev {
           *freqs_win = nullptr, *freqs_comp = nullptr, *xe = nullptr, *xg = nullptr, *xu = nullptr, *xhh = nullptr,
           *ed = nullptr;
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
+    TopkScratch tks;                                   // a window's indexer top k over long rows (topk's segments)
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     uint8_t* eg_rows = nullptr;
     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
@@ -719,6 +720,10 @@ struct WinPlan {
     unsigned win = 0;
     int k = 0;              // (a run of chunks) the chunk's index: its hand-off slot k % 2
     unsigned vl = 0;        // (a window) bit t: token t is inside a picture's span (routed with the image bias)
+    // (a prompt's window, Options::prefill_keep's approximate tail) skip: before the tail - layer n_pre its KV source's
+    // part alone, the layers after it nothing; lo: the tail's start, the consumer layers' window floor (0: none)
+    bool skip = false;
+    int64_t lo = 0;
     unsigned seq[kMaxL] = {};
     int topk[kMaxL][kWin] = {}, cand[kMaxL][kWin] = {};
 };
@@ -743,6 +748,12 @@ struct Model::Impl {
     std::vector<std::unique_ptr<Chunk>> chunks;   // per device
     size_t eg_cap = kWin;             // tokens h_eg holds
     int tap_cap = kWin;               // rows h_taps holds (a chunk seeds the drafter with its last 128)
+    // YOCO (DeepInfer's n_prefill_layer): the first layer of compress ratio 1 - it and the layers after it (the
+    // consumers) read the KV and index keys its compressor makes from its input, so a long run's rows before the tail
+    // need only its compressor there (Options::prefill_keep); -1: no such split
+    int n_pre = -1;
+    bool win_skip = false;            // the next window's WinPlan::skip / lo (Model::feed's windows of a truncated prompt)
+    int64_t win_lo = 0;
     bool logits_all = false;          // the last feed was a chunk with logits for every row (chunk_logits)
     std::vector<float> chunk_logits;
     std::function<void(int64_t)> progress;   // a run of chunks: the tokens done so far (the main thread, while it waits)
@@ -763,15 +774,76 @@ struct Model::Impl {
     bool mk_split = false;
     uint16_t* h_mk_embed = nullptr;
     unsigned* mk_slots = nullptr;
+    unsigned* mk_lists = nullptr;     // host-mapped [step][member] kSpecList: a sampled draft's shares' top k (spec_pick)
     unsigned mk_seq = 0;
     int d_dev = 0;                    // the drafter's first block's device
     bool spec_win = false;            // the window being run is a draft's verification (layer() keeps backups)
     float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps
     cudaEvent_t ev_seed = nullptr;    // the drafter's seeding read h_taps: the next window's taps wait for it
-    float *d_confv = nullptr, *d_prob = nullptr, *d_ban = nullptr;   // on the head device
-    int* d_ints = nullptr;            // on the head device: drafts in, picks out
+    float* d_confv = nullptr;         // on the head device
+    int* d_ints = nullptr;            // on the head device: [0, 16) the draft chain, [16, 32) greedy picks, [32, 48) the
+                                      // drafts verified, [48, 64) their verdicts
     float conf_threshold = std::getenv("DS4_DSPARK_CONF") ? (float) std::atof(std::getenv("DS4_DSPARK_CONF")) : 0.5f;
-    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    // speculative sampling (a sampled request): the trunk's token the draft with probability min(1, p/q) under the
+    // request's chain (top_k, top_p, min_p, temperature), else a draw from max(0, p - q) - each kept token distributed
+    // as the trunk's own draw.  The drafts the drafter's argmax (q a point at each: kept with p's probability), or with
+    // DS4_DRAFT_SAMPLE=1 (a request's draft=sample) drawn from its distribution, their kept lists in d_spec[i] - a
+    // draft then standing sum min(p, q) of the time instead of p(argmax q): +1-3.5 points a position on one prompt's
+    // rows, but no more tokens a round on 40 chat answers (2.446 against 2.454, 3.5 bits, --tp 9, temperature 1.0)
+    const bool draft_sample_env =
+        std::getenv("DS4_DRAFT_SAMPLE") != nullptr && std::atoi(std::getenv("DS4_DRAFT_SAMPLE")) != 0;
+    bool draft_sample = draft_sample_env;   // (a request's draft=greedy|sample: set_draft_sample)
+    strata::kernels::SpecList *d_spec = nullptr, *h_spec = nullptr;   // [kWin]: the head device's, pinned
+    bool spec_lists = false;          // the last draft's lists are in d_spec
+    // DS4_SPEC_DIAG=1 (sampled drafts): each verified position's chance to stand both ways on the same rows - p(argmax q)
+    // (a greedy draft) and sum min(p, q) (a drawn one) - by position, printed every 64 rounds
+    bool spec_diag = std::getenv("DS4_SPEC_DIAG") != nullptr;
+    double diag_g[kWin] = {}, diag_s[kWin] = {};
+    long long diag_n[kWin] = {}, diag_rounds = 0;
+    // DS4_DRAFT_TIMES=1: a draft's host time by phase (the blocks enqueued, the head, the markov steps, the wait), every
+    // 64 drafts
+    bool draft_times = std::getenv("DS4_DRAFT_TIMES") != nullptr;
+    // DS4_TOPK_CHECK=1: each window's indexer top k (the segmented one, TopkScratch) again a block a row, the two
+    // compared - the calls and the rows that differed, every 256 calls
+    bool topk_check = std::getenv("DS4_TOPK_CHECK") != nullptr;
+    std::atomic<long long> tkc_calls{0}, tkc_bad{0};
+    // DS4_INDEX_CHECK=1: each window's indexer scores (the tensor cores' kernel) again on the CUDA cores, into the score
+    // rows past the window's - the -inf the same, and the largest difference of the row's largest, every 256 calls
+    bool index_check = std::getenv("DS4_INDEX_CHECK") != nullptr;
+    std::atomic<long long> ixc_calls{0}, ixc_bad{0};
+    std::atomic<uint32_t> ixc_worst{0};   // (a float's bits)
+    void index_check_rows(Dev& d, int il, const float* q, const float* w, const uint8_t* kp, int T, int n, const int* cand,
+                          int blk, const Rows& lim, long long ss, cudaStream_t s) {
+        if (2 * T > kWin || n <= 0) return;
+        float* ref = d.scores + (size_t) T * ss;
+        index_score(q, w, nullptr, kp, g.ix_heads, g.ix_hd, T, n, cand, (int) cand_stride(), blk, lim, ref, ss, s, false);
+        std::vector<float> a((size_t) T * n), b((size_t) T * n);
+        cudaMemcpy2DAsync(a.data(), (size_t) n * 4, d.scores, (size_t) ss * 4, (size_t) n * 4, (size_t) T,
+                          cudaMemcpyDeviceToHost, s);
+        cudaMemcpy2DAsync(b.data(), (size_t) n * 4, ref, (size_t) ss * 4, (size_t) n * 4, (size_t) T, cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+        bool bad = false;
+        float worst = 0.0f;
+        for (int t = 0; t < T; ++t) {
+            float mx = 0.0f;
+            for (int i = 0; i < n; ++i)
+                if (std::isfinite(b[(size_t) t * n + i])) mx = std::max(mx, std::fabs(b[(size_t) t * n + i]));
+            for (int i = 0; i < n; ++i) {
+                const float x = a[(size_t) t * n + i], y = b[(size_t) t * n + i];
+                if (std::isfinite(x) != std::isfinite(y)) bad = true;
+                else if (std::isfinite(x) && mx > 0.0f) worst = std::max(worst, std::fabs(x - y) / mx);
+            }
+        }
+        if (bad || worst > 1e-5f) ++ixc_bad;
+        uint32_t cur = ixc_worst.load();
+        while (worst > __builtin_bit_cast(float, cur) && !ixc_worst.compare_exchange_weak(cur, __builtin_bit_cast(uint32_t, worst))) {}
+        const long long nc = ++ixc_calls;
+        if (nc % 256 == 0 || bad)
+            std::fprintf(stderr, "index check: %lld calls, %lld off (layer %d, n %d), worst %.2e of a row's largest\n", nc,
+                         ixc_bad.load(), il, n, __builtin_bit_cast(float, ixc_worst.load()));
+    }
+    double dt_acc[4] = {};
+    long long dt_n = 0;
 
     uint16_t* embed_pinned = nullptr;
     std::vector<float> freqs_win, freqs_comp;
@@ -1339,9 +1411,12 @@ struct Model::Impl {
                         o.vram_experts;
             file_experts = exp_b - std::max(0.0, room - other_b) + (double) kRamMargin > (double) ram_avail();
         }
-        chunk = par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : file_experts ? kVlRows : 2048) : 0;
+        // (4096 in RAM: at --tp 9 a 16K prompt 896 -> 1336 tok/s and a 64K one 1132 -> 1651, its buffers ~240 experts
+        // a GPU out of VRAM - decode 54.4 -> 52.3 tok/s at 3.5 bits; 8192 leaves the CPU lane more than the RAM)
+        chunk = par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : file_experts ? kVlRows : 4096) : 0;
         if (const char* v = std::getenv("DS4_CHUNK")) chunk = par ? std::atoi(v) : 0;
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
+        if (const char* v = std::getenv("DS4_PREFILL_KEEP")) o.prefill_keep = std::atoi(v);
         recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && !file_experts ? 32.0f : 0.0f));
         if (chunk > 0) {
             chunk = std::min(kVlRows, std::max(256, chunk / 16 * 16));   // (route()'s image bits cover a chunk)
@@ -1399,6 +1474,14 @@ struct Model::Impl {
             if (eg != g.eg_layers.end()) l.eg = (int) (eg - g.eg_layers.begin());
             if (!expert_layout(l, err)) return false;
         }
+
+        // YOCO's split: the first layer of ratio 1 a KV source, no KV source and no Engram layer after it (where they come
+        // later the consumers' rows would matter to them)
+        for (int il = 0; il < g.nl && n_pre < 0; ++il)
+            if (L[(size_t) il].ratio == 1 && L[(size_t) il].kv_src) n_pre = il;
+        for (int il = n_pre + 1; n_pre >= 0 && il < g.nl; ++il)
+            if (L[(size_t) il].kv_src || L[(size_t) il].eg >= 0) n_pre = -1;
+        if (n_pre >= 0 && L[(size_t) n_pre].eg >= 0) n_pre = -1;
 
         // the split: each layer's dense weights + its experts, the head on the last GPU
         for (Layer& l : L) {
@@ -1586,6 +1669,9 @@ struct Model::Impl {
                       dalloc(d, d.cgr, W * g.hd, err) && dalloc(d, d.latent, W * g.hd, err) &&
                       dalloc(d, d.ikr, W * g.ix_hd, err) && dalloc(d, d.iq, W * g.ix_heads * g.ix_hd, err) &&
                       dalloc(d, d.iw, W * 64, err) && dalloc(d, d.scores, W * cap, err) &&
+                      dalloc(d, d.tks.val, kTksRows * tks_p() * g.ix_topk, err) &&
+                      dalloc(d, d.tks.idx, kTksRows * tks_p() * g.ix_topk, err) &&
+                      dalloc(d, d.tks.cnt, kTksRows * tks_p(), err) && dalloc(d, d.tks.kth, kTksRows * tks_p(), err) &&
                       dalloc(d, d.bm, W * bm_stride(), err) && dalloc(d, d.o, W * g.heads * g.hd, err) &&
                       dalloc(d, d.oa, W * g.o_groups * g.o_lora, err) && dalloc(d, d.ao, W * D, err) &&
                       dalloc(d, d.mix, W * 32, err) && dalloc(d, d.a_pre, W * 8, err) && dalloc(d, d.a_post, W * 8, err) &&
@@ -1602,6 +1688,7 @@ struct Model::Impl {
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
                       dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err);
             if (!ok) return false;
+            d.tks.T = (int) kTksRows, d.tks.P = (int) tks_p(), d.tks.K = g.ix_topk;
             if (!g.eg_layers.empty()) {
                 const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
                 ok = dalloc(d, d.eg_rows, W * cols * (pk.eg_hd + pk.eg_hd / 32), err) &&
@@ -1616,7 +1703,7 @@ struct Model::Impl {
                 return false;
             if (g.n_mtp > 0 && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
             if (g.n_mtp > 0 && (int) di == head_dev &&
-                (!dalloc(d, d_confv, kWin, err) || !dalloc(d, d_prob, kWin, err) || !dalloc(d, d_ban, (size_t) g.vocab, err) ||
+                (!dalloc(d, d_confv, kWin, err) || !dalloc(d, d_spec, kWin, err) || !halloc(h_spec, kWin, err) ||
                  !dalloc(d, d_ints, 64, err)))
                 return false;
             CK(cudaEventCreateWithFlags(&d.ev_out, cudaEventDisableTiming));
@@ -1718,8 +1805,13 @@ struct Model::Impl {
                 err = "the markov embed: not a BF16 [vocab][rank] table";
                 return false;
             }
+            if (head_nm() > kSpecMembers) {
+                err = "the markov steps over a head group of more than " + std::to_string(kSpecMembers) + " members";
+                return false;
+            }
             if (!hmap(h_mk_embed, (size_t) g.vocab * g.d_rank, err) || !pk.read(*te, h_mk_embed) ||
-                !hmap(mk_slots, (size_t) kWin * head_nm() * 4, err)) {
+                !hmap(mk_slots, (size_t) kWin * head_nm() * 4, err) ||
+                !hmap(mk_lists, (size_t) kWin * head_nm() * kSpecList, err)) {
                 if (err.empty()) err = "the markov embed: read failed";
                 return false;
             }
@@ -2869,6 +2961,11 @@ struct Model::Impl {
             std::snprintf(line, sizeof line, "ds4: %d routed experts on the CPU lane (%.1f GB of RAM, %d NUMA parts), %d threads\n", nh,
                           hb_ / 1e9, NH, cpu_threads());
         s << line;
+        if (n_pre >= 0 && chunk > 0 && o.prefill_keep >= 0) {
+            std::snprintf(line, sizeof line, "ds4: a long prompt's layers %d-%d over its last %d rows (%s)\n", n_pre, g.nl - 1,
+                          tail_rows(1 << 30), o.prefill_keep > 0 ? "approximate: their windows cut there" : "exact");
+            s << line;
+        }
         return s.str();
     }
 
@@ -4008,16 +4105,34 @@ struct Model::Impl {
         return true;
     }
 
-    bool draft(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err) {
+    struct Samp {   // a request's sampling, and the draw index of the token after the drafted one
+        float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
+        int top_k = 64;
+        uint64_t seed = 0, counter = 0;
+        strata::kernels::SamplerParams at(uint64_t k) const {   // (the chain for draw counter + k)
+            strata::kernels::SamplerParams sp;
+            sp.temperature = temperature;
+            sp.greedy = temperature <= 0.0f;
+            sp.top_p = top_p;
+            sp.top_k = top_k;
+            sp.min_p = min_p;
+            sp.seed = seed;
+            sp.counter = counter + k;
+            return sp;
+        }
+    };
+    bool draft(int y, const Samp& sm, std::vector<int>& out, std::vector<float>& conf, std::string& err) {
         const double t0 = now_ms();
-        const bool ok = draft_(y, out, conf, err);
+        const bool ok = draft_(y, sm, out, conf, err);
         st.draft_ms += now_ms() - t0;
         ++st.drafts_rounds;
         return ok;
     }
-    bool draft_(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err) {
+    bool draft_(int y, const Samp& sm, std::vector<int>& out, std::vector<float>& conf, std::string& err) {
         out.clear();
         conf.clear();
+        spec_lists = false;
+        const bool sampled = sm.temperature > 0.0f && draft_sample;
         const int T = g.d_block, D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank;
         const int64_t p0 = pos;
         if (g.n_mtp == 0 || T < 1 || T > kWin || p0 + T > o.max_context) return true;
@@ -4037,8 +4152,10 @@ struct Model::Impl {
             dp.seq[il] = ++seq_issued;
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
+        const double tq0 = now_ms();
         for (int i = 0; i < g.n_mtp; ++i)
             if (!layer(L[(size_t) (g.nl + i)], 0, p0, T, dp, err)) return false;
+        const double tq1 = now_ms();
         cudaSetDevice(d.id);
         hc_pre_norm(d.h, d.pre, nullptr, D, H, T, g.eps, d.x, d.st);   // (the confidence head reads it before the norm)
         Dev& hd = devs[(size_t) head_dev];
@@ -4069,6 +4186,7 @@ struct Model::Impl {
             finish(e.ao, T, D, D, fn, e.st);
             if (!head_share(e, m, e.ao, T, err, !mk_split)) return false;
         }
+        const double tq2 = now_ms();
         h_idx[0] = y;
         if (mk_split) {
             // the markov steps over the group: each member its rows of the bias and its share's argmax, every member
@@ -4088,28 +4206,58 @@ struct Model::Impl {
                     cudaSetDevice(e.id);
                     float* row = m == 0 ? hd.logits + (size_t) i * V : e.logits_part + (size_t) i * e.mk_vn;
                     markov_share(row, e.mk_share, e.mk_erow, e.mk_vn, R, e.st);
+                    if (sampled) {   // (each member its share's top k, every member the same draw of the merged row)
+                        SpecChain ch;
+                        ch.k = sm.top_k > 0 && sm.top_k < 64 ? sm.top_k : 64;
+                        ch.top_p = sm.top_p;
+                        ch.min_p = sm.min_p;
+                        ch.temperature = sm.temperature;
+                        ch.seed = sm.seed;
+                        ch.counter = sm.counter + (uint64_t) i;
+                        unsigned* lists = mk_lists + (size_t) i * nm * kSpecList;
+                        topk_share(row, e.mk_vn, e.mk_v0, ch.k, lists + (size_t) m * kSpecList, seq, e.st);
+                        spec_pick(lists, nm, kSpecList, seq, ch, e.mk_ints + i + 1, h_mk_embed, e.mk_erow, R,
+                                  m == 0 ? d_spec + i : nullptr, e.st);
+                        continue;
+                    }
                     argmax_share(row, e.mk_vn, e.mk_v0, mk_slots + ((size_t) i * nm + m) * 4, seq, e.st);
                     markov_pick(mk_slots + (size_t) i * nm * 4, nm, seq, e.mk_ints + i + 1, h_mk_embed, e.mk_erow, R,
                                 e.st);
                 }
             cudaSetDevice(hd.id);
+            spec_lists = sampled;
         } else {
             cudaSetDevice(hd.id);
             CK(cudaMemcpyAsync(d_ints, h_idx, 4, cudaMemcpyHostToDevice, hd.st));
             strata::kernels::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
-            for (int i = 0; i < T; ++i) {   // the markov bias of the token before, then that position's (greedy) draft
+            // the markov bias of the token before, then that position's draft: greedy, or (sampled) drawn through the
+            // request's chain with its kept list - the token draw counter + i will be
+            for (int i = 0; i < T; ++i) {
                 markov_add(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
-                strata::kernels::sample_tokens(hd.logits + (size_t) i * V, 1, V, nullptr, 0, sp, d_ints + i + 1, hd.st);
+                if (sampled)
+                    strata::kernels::sample_draft(hd.logits + (size_t) i * V, 1, V, sm.at((uint64_t) i), d_spec + i,
+                                                  d_ints + i + 1, hd.st);
+                else
+                    strata::kernels::sample_tokens(hd.logits + (size_t) i * V, 1, V, nullptr, 0, sp, d_ints + i + 1, hd.st);
             }
+            spec_lists = sampled;
         }
         confidence(hd.x, d_mk_embed, d_ints, d_conf, T, D, R, d_confv, hd.st);
         int tok[kWin + 1];
         float cf[kWin];
         CK(cudaMemcpyAsync(h_idx, d_ints, (size_t) (T + 1) * 4, cudaMemcpyDeviceToHost, hd.st));
         CK(cudaMemcpyAsync(h_w, d_confv, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
+        const double tq3 = now_ms();
         CK(cudaStreamSynchronize(hd.st));
+        if (draft_times) {
+            const double tq4 = now_ms();
+            dt_acc[0] += tq1 - tq0, dt_acc[1] += tq2 - tq1, dt_acc[2] += tq3 - tq2, dt_acc[3] += tq4 - tq3;
+            if (++dt_n % 64 == 0)
+                std::fprintf(stderr, "draft host ms (%lld drafts): blocks %.3f, head %.3f, markov steps %.3f, wait %.3f\n", dt_n,
+                             dt_acc[0] / dt_n, dt_acc[1] / dt_n, dt_acc[2] / dt_n, dt_acc[3] / dt_n);
+        }
         for (int i = 0; i <= T; ++i) tok[i] = h_idx[i];
         for (int i = 0; i < T; ++i) cf[i] = h_w[i];
         for (int i = 0; i < T; ++i) {
@@ -4140,11 +4288,11 @@ struct Model::Impl {
     }
 
     // [y, drafts] at positions pos ..: the trunk's verdict, its next token, and the state back to what it kept.
-    // Greedy: the drafts the trunk's argmax agrees with.  Sampled: a draft d stands with the trunk's probability of d
-    // (the drafts are the drafter's argmax: its distribution a point at d), a rejected one is replaced by a draw with d
-    // banned - so each kept token is distributed as the trunk's own draw.
-    bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
-                uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err) {
+    // Greedy: the drafts the trunk's argmax agrees with.  Sampled: speculative sampling over the request's chain - each
+    // draft kept with probability min(1, p/q) (q its kept list: the drafter's, or a point at a greedy draft), the first
+    // one rejected replaced by a draw from max(0, p - q), all kept: the next row's plain draw (draw counter + i for row
+    // i) - so each token is distributed as the trunk's own draw.
+    bool verify(int y, const std::vector<int>& drafts, const Samp& sm, int& accepted, int& next, std::string& err) {
         const int n = (int) std::min<size_t>(drafts.size(), (size_t) kWin - 1);
         const int T = n + 1, V = g.vocab;
         const int64_t p0 = pos;
@@ -4160,7 +4308,7 @@ struct Model::Impl {
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
         int m = 0;
-        if (temperature <= 0.0f) {
+        if (sm.temperature <= 0.0f) {
             strata::kernels::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
@@ -4172,26 +4320,47 @@ struct Model::Impl {
         } else {
             for (int i = 0; i < n; ++i) h_idx[i] = drafts[(size_t) i];
             CK(cudaMemcpyAsync(d_ints + 32, h_idx, (size_t) n * 4, cudaMemcpyHostToDevice, hd.st));
-            draft_probs(hd.logits, d_ints + 32, n, V, temperature, d_prob, hd.st);
-            CK(cudaMemcpyAsync(h_w, d_prob, (size_t) n * 4, cudaMemcpyDeviceToHost, hd.st));
-            CK(cudaStreamSynchronize(hd.st));
-            rng = rng ^ (seed * 0x9E3779B97F4A7C15ull) ^ (counter + 1) * 0xBF58476D1CE4E5B9ull;
-            auto uniform = [&]() {
-                rng ^= rng >> 12;
-                rng ^= rng << 25;
-                rng ^= rng >> 27;
-                return (double) ((rng * 0x2545F4914F6CDD1Dull) >> 11) * (1.0 / 9007199254740992.0);
-            };
-            while (m < n && uniform() < (double) h_w[m]) ++m;
-            if (m == n) {
-                next = sample_row(n, temperature, top_p, top_k, min_p, seed, counter, nullptr);
-            } else {
-                const float ban = -INFINITY, zero = 0.0f;
-                CK(cudaMemcpy(d_ban + drafts[(size_t) m], &ban, 4, cudaMemcpyHostToDevice));
-                next = sample_row(m, temperature, top_p, top_k, min_p, seed, counter, d_ban);
-                CK(cudaMemcpy(d_ban + drafts[(size_t) m], &zero, 4, cudaMemcpyHostToDevice));
+            if (!spec_lists) {   // greedy drafts: q a point at each
+                for (int i = 0; i < n; ++i) {
+                    h_spec[i].n = 1;
+                    h_spec[i].ids[0] = drafts[(size_t) i];
+                    h_spec[i].p[0] = 1.0;
+                }
+                CK(cudaMemcpyAsync(d_spec, h_spec, (size_t) n * sizeof(*h_spec), cudaMemcpyHostToDevice, hd.st));
             }
+            if (spec_diag && spec_lists && n <= 8) {   // (p's kept lists beside q's: the trunk's rows through the chain)
+                strata::kernels::sample_draft(hd.logits, n, V, sm.at(0), d_spec + 8, d_ints + 16, hd.st);
+                CK(cudaMemcpyAsync(h_spec, d_spec, (size_t) (8 + n) * sizeof(*h_spec), cudaMemcpyDeviceToHost, hd.st));
+                CK(cudaStreamSynchronize(hd.st));
+                for (int i = 0; i < n; ++i) {
+                    const strata::kernels::SpecList &q = h_spec[i], &pp = h_spec[8 + i];
+                    double sg = 0.0, ss = 0.0;
+                    for (int a = 0; a < pp.n; ++a) {
+                        if (pp.ids[a] == q.ids[0]) sg = pp.p[a];
+                        for (int b = 0; b < q.n; ++b)
+                            if (q.ids[b] == pp.ids[a]) ss += std::min(pp.p[a], q.p[b]);
+                    }
+                    diag_g[i] += sg;
+                    diag_s[i] += ss;
+                    ++diag_n[i];
+                }
+                if (++diag_rounds % 64 == 0) {
+                    std::fprintf(stderr, "spec diag after %lld rounds (position: rounds, greedy p(argmax q), drawn sum min(p,q)):",
+                                 diag_rounds);
+                    for (int i = 0; i < kWin && diag_n[i] > 0; ++i)
+                        std::fprintf(stderr, " %d: %lld %.3f %.3f", i, diag_n[i], diag_g[i] / diag_n[i], diag_s[i] / diag_n[i]);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+            strata::kernels::sample_verify(hd.logits, n, V, sm.at(0), d_spec, d_ints + 32, d_ints + 48, hd.st);
+            CK(cudaMemcpyAsync(h_idx, d_ints + 48, (size_t) n * 4, cudaMemcpyDeviceToHost, hd.st));
+            CK(cudaStreamSynchronize(hd.st));
+            while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
+            if (m < n) next = h_idx[m];
+            else next = sample_row(n, sm.temperature, sm.top_p, sm.top_k, sm.min_p, sm.seed, sm.counter + (uint64_t) n,
+                                   nullptr);
         }
+        spec_lists = false;
         rollback(p0, T, m + 1);
         if (!seed_drafter(p0, m + 1, 0, err)) return false;
         accepted = m;
@@ -4265,7 +4434,9 @@ struct Model::Impl {
 
     // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
     // projections as GEMMs, the attention and the indexer in slabs, the routed experts as sorted rows: the VRAM ones in
-    // place, the CPU lane's streamed in batches)
+    // place, the CPU lane's streamed in batches).  src_only: the KV source's part alone - its compressed KV and index
+    // keys from the attention's input (YOCO's first consumer layer, a chunk before a truncated run's tail); lo: the
+    // window's floor (a truncated run's consumer layers: its tail's start)
     // a chunk's sum over its group: three members or more through the copy engines (allreduce_dma, c.y its scratch:
     // free between the MoE's sets), unless DS4_AR_DMA=0
     void chunk_allreduce(Dev& d, Chunk& c, const ArGroup& ab, int mi, int n, cudaStream_t s) {
@@ -4311,7 +4482,7 @@ struct Model::Impl {
         c.pend = false;
     }
     bool layer_chunk(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err,
-                     bool defer = false) {
+                     bool defer = false, bool src_only = false, int64_t lo = 0) {
         Layer& l = member(L0, mi);
         Dev& d = devs[(size_t) l.dev];
         Chunk& c = *chunks[(size_t) l.dev];
@@ -4323,7 +4494,7 @@ struct Model::Impl {
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
         // the residual the layer before owes: by ranges beside the attention's first, row-wise steps below, or (an
         // Engram layer: its gate reads the whole residual first) whole now
-        const bool by_range = c.pend && l.eg < 0 && c.pend_T == T;
+        const bool by_range = c.pend && l.eg < 0 && c.pend_T == T && !src_only;
         if (!by_range) pend_finish(c, s);
         // Engram, in slabs of 256 tokens
         if (l.eg >= 0) {
@@ -4351,17 +4522,20 @@ struct Model::Impl {
         // attention: the row-wise first steps (rows [r0, r0 + n))
         auto first_steps = [&](int r0, int n) -> bool {
             const size_t a = (size_t) r0;
-            if (!hc_mix_chunk(d, c, c.h + a * H * D, l.hca_fn, n, c.mix + a * 32, err)) return false;
-            hc_split(c.mix + a * 32, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, n, c.a_pre + a * 8,
-                     c.a_post + a * 8, c.a_comb + a * 64, s);
+            if (!src_only) {
+                if (!hc_mix_chunk(d, c, c.h + a * H * D, l.hca_fn, n, c.mix + a * 32, err)) return false;
+                hc_split(c.mix + a * 32, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, n, c.a_pre + a * 8,
+                         c.a_post + a * 8, c.a_comb + a * 64, s);
+            }
             hc_pre_norm(c.h + a * H * D, c.pre + a * 8, l.attn_norm, D, H, n, g.eps, c.x + a * D, s);
             x3::rows_f16(c.x + a * D, D, nullptr, n, D, c.x16 + a * D, s);
-            if (!gemm(d, c, l.wq_a, c.x16 + a * D, D, n, c.qr + a * g.q_lora, g.q_lora, 0.0f, err) ||
-                !gemm(d, c, l.wkv, c.x16 + a * D, D, n, c.kvr + a * HD, HD, 0.0f, err))
+            if (!src_only && (!gemm(d, c, l.wq_a, c.x16 + a * D, D, n, c.qr + a * g.q_lora, g.q_lora, 0.0f, err) ||
+                              !gemm(d, c, l.wkv, c.x16 + a * D, D, n, c.kvr + a * HD, HD, 0.0f, err)))
                 return false;
             if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16 + a * D, D, n, c.ckr + a * HD, HD, 0.0f, err)) return false;
             if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16 + a * D, D, n, c.cgr + a * HD, HD, 0.0f, err))
                 return false;
+            if (src_only) return true;
             Finish fq;
             fq.w = l.q_norm;
             fq.eps = g.eps;
@@ -4383,18 +4557,20 @@ struct Model::Impl {
         } else if (!first_steps(0, T))
             return false;
         // the window rows: the ring's (positions p0 - win ..) then the chunk's
-        ring_to_ext(l.win, c.ext, p0, g.win, HD, s);
-        Finish fk;
-        fk.w = l.kv_norm;
-        fk.eps = g.eps;
-        fk.rd = g.rd;
-        fk.pos = (int) p0;
-        fk.freqs = freqs;
-        fk.quant = 1;
-        fk.dst = c.ext + (size_t) g.win * HD;
-        fk.dst_stride = HD;
-        finish(c.kvr, T, HD, HD, fk, s);
-        ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr);
+        if (!src_only) {
+            ring_to_ext(l.win, c.ext, p0, g.win, HD, s);
+            Finish fk;
+            fk.w = l.kv_norm;
+            fk.eps = g.eps;
+            fk.rd = g.rd;
+            fk.pos = (int) p0;
+            fk.freqs = freqs;
+            fk.quant = 1;
+            fk.dst = c.ext + (size_t) g.win * HD;
+            fk.dst_stride = HD;
+            finish(c.kvr, T, HD, HD, fk, s);
+            ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr);
+        }
         const uint8_t* ckv = nullptr;   // (the source's packed rows)
         const long long ss = (long long) o.max_context + 64;
         if (l.ratio > 0) {
@@ -4431,7 +4607,7 @@ struct Model::Impl {
                     fi.pdst_stride = (long long) ik_row();
                     finish(c.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
                 }
-                if (clen_max > 0) {
+                if (clen_max > 0 && !src_only) {
                     if (!gemm_f16w(c, l.i_wproj, g.ix_heads, D, c.x16, D, T,
                                    1.0f / std::sqrt((float) g.ix_hd) / std::sqrt((float) g.ix_heads), c.iw, 64, err))
                         return false;
@@ -4512,6 +4688,7 @@ struct Model::Impl {
             }
             ckv = sr.ckv[(size_t) l.dev];
         }
+        if (src_only) return true;
         // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc; with three
         // members or more each slab's sum on ar_s while the next slab computes (every member the same slabs: c.A
         // is the group's, a member without heads its zeros)
@@ -4540,6 +4717,7 @@ struct Model::Impl {
             AttnRows ar;
             ar.gen = 1;
             ar.p0 = p0;
+            ar.lo = lo;
             ar.t0 = a0;
             ar.win = g.win;
             ar.R = l.ratio;
@@ -4684,7 +4862,26 @@ struct Model::Impl {
         std::vector<int64_t> p0;
         std::vector<int> T;
         std::vector<unsigned> seq;
+        // a truncated run (tail_rows): skip[k] - chunk k is before the tail (layer n_pre its KV source's part alone, the
+        // layers after it nothing); lo - the tail's start, the consumer layers' window floor (0: not truncated)
+        std::vector<char> skip;
+        int64_t lo = 0;
+        // chunk k at layer il: the whole layer, or any of it (the source's part)
+        bool full(int k, int il, int n_pre) const { return !skip[(size_t) k] || il < n_pre; }
+        bool any(int k, int il, int n_pre) const { return !skip[(size_t) k] || il <= n_pre; }
     };
+    // topk's segments (TopkScratch): for a verify window's rows (a drafter's block and its token: 6; wider windows, a
+    // prompt's 16, take topk_kernel), as many a row as the longest row needs - 0.5 MB a device at 256K
+    static constexpr size_t kTksRows = 8;
+    size_t tks_p() const {
+        return (size_t) std::max(2, std::min(kTopkSegMax, (int) ((o.max_context + kTopkSeg - 1) / kTopkSeg)));
+    }
+    // the rows of a run of n that go through the consumer layers (Options::prefill_keep; n: all of them)
+    int tail_rows(int n) const {
+        if (n_pre < 0 || o.prefill_keep < 0 || logits_all || dump_l != nullptr) return n;
+        const int R = o.prefill_keep > 0 ? std::max(o.prefill_keep, g.win) : (g.win - 1) * (g.nl - n_pre) + g.win;
+        return std::min(n, R);
+    }
     bool run_dev_chunks(int di, const Run& run, std::string& err) {
         Dev& d = devs[(size_t) di];
         Chunk& c = *chunks[(size_t) di];
@@ -4698,7 +4895,7 @@ struct Model::Impl {
                 const Layer& L0 = L[(size_t) il];
                 bool here = false;
                 for (int m = 0; m < L0.nm; ++m) here = here || member(L0, m).dev == di;
-                if (!here) continue;
+                if (!here || !run.full(k, il, n_pre)) continue;   // (a skipped chunk's layer streams nothing)
                 for (int j0 = 0; j0 < (int) L0.host_list.size(); j0 += B)
                     S.b.push_back({k, il, j0, std::min(B, (int) L0.host_list.size() - j0)});
             }
@@ -4735,7 +4932,7 @@ struct Model::Impl {
                 for (int m = 0; m < L0.nm; ++m)
                     if (member(L0, m).dev == di) mi = m;
                 if (mi < 0) continue;
-                if (!started) {   // the chunk's input: its embedding rows, or the previous group's hand-off
+                if (!started && run.any(k, il, n_pre)) {   // the chunk's input: its embedding rows, or the previous group's hand-off
                     started = true;
                     if (il == 0) {
                         if (k >= 2) CK(cudaEventSynchronize(c.emb_ev[slot]));
@@ -4785,6 +4982,9 @@ struct Model::Impl {
                                              (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
                 }
+                if (!run.any(k, il, n_pre)) continue;   // (a chunk before a truncated run's tail: its sources' rows only)
+                const bool src_only = !run.full(k, il, n_pre);
+                const int64_t lo = il >= n_pre ? run.lo : 0;
                 const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
                 // DS4_AR_DEFER=1: the MoE's sum by ranges beside the next layer's first steps (off: +0-2% on the
                 // 16K-token prompt, and those steps' GEMMs on a range's rows round their sums otherwise - perplexity
@@ -4793,11 +4993,16 @@ struct Model::Impl {
                     const char* e = std::getenv("DS4_AR_DEFER");
                     return e != nullptr && std::atoi(e) != 0;
                 }();
-                if (!layer_chunk(L0, mi, p0, T, wp, S, err, defer_ok && !last && dump_l == nullptr)) return false;
+                if (!layer_chunk(L0, mi, p0, T, wp, S, err, defer_ok && !last && dump_l == nullptr && !src_only, src_only,
+                                 lo))
+                    return false;
                 if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
-                if (last && mi == 0 && il + 1 < g.nl) {   // the hand-off, once the next group took the chunk before last
+                // the hand-off, once the next group took the chunk before last (the chunks it takes: a truncated run's
+                // consumer layers take only its tail)
+                if (last && mi == 0 && il + 1 < g.nl && run.any(k, il + 1, n_pre)) {
                     const int nnext = L[(size_t) il + 1].nm;
-                    if (k >= 2) wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
+                    if (k >= 2 && run.any(k - 2, il + 1, n_pre))
+                        wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
                     xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
                 }
             }
@@ -4842,22 +5047,32 @@ struct Model::Impl {
             }
         // equal chunks of at most `chunk`; DS4_CHUNK_FIRST=N: the first one N tokens, the rest equal - the first
         // group hands the next one its first chunk sooner (the pipeline's start), the rest stream the experts as few
-        // times as before
+        // times as before.  A truncated run (tail_rows): the rows before its tail and the tail each so
         static const int first_env = std::getenv("DS4_CHUNK_FIRST") ? std::atoi(std::getenv("DS4_CHUNK_FIRST")) : 0;
-        const int first = first_env > 0 && n > first_env + 16 ? std::min(chunk, std::max(16, first_env / 16 * 16)) : 0;
-        Run run;
-        if (first > 0) {
-            run.p0.push_back(pos);
-            run.T.push_back(first);
-            run.seq.push_back(++win_seq);
-        }
-        const int rest = n - first, nc = (rest + chunk - 1) / chunk, per = (rest + nc - 1) / nc;
-        for (int a = first; a < n; a += per) {
-            run.p0.push_back(pos + a);
-            run.T.push_back(std::min(per, n - a));
-            run.seq.push_back(++win_seq);
-        }
         logits_all = logits_rows > kWin;
+        const int tail = tail_rows(n);
+        Run run;
+        run.lo = tail < n ? pos + n - tail : 0;
+        auto part = [&](int a0, int a1, bool skip) {
+            if (a1 <= a0) return;
+            const int first = a0 == 0 && first_env > 0 && a1 - a0 > first_env + 16
+                                  ? std::min(chunk, std::max(16, first_env / 16 * 16)) : 0;
+            auto push = [&](int a, int t) {
+                run.p0.push_back(pos + a);
+                run.T.push_back(t);
+                run.seq.push_back(++win_seq);
+                run.skip.push_back(skip ? 1 : 0);
+            };
+            if (first > 0) push(a0, first);
+            const int b0 = a0 + first, rest = a1 - b0, nc = (rest + chunk - 1) / chunk, per = (rest + nc - 1) / nc;
+            for (int a = b0; a < a1; a += per) push(a, std::min(per, a1 - a));
+        };
+        part(0, n - tail, true);
+        part(n - tail, n, false);
+        if (std::getenv("DS4_TRUNC_SPLIT_ONLY") != nullptr) {   // (a test: the truncated run's chunks, every row everywhere)
+            std::fill(run.skip.begin(), run.skip.end(), 0);
+            run.lo = 0;
+        }
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);
         for (int t = 0; t < n; ++t) {
             toks.push_back(tk[t]);
@@ -4936,6 +5151,8 @@ struct Model::Impl {
         wp.par = par;
         wp.async = par || (!sync_decode && T <= async_max_t);
         wp.vl = 0;
+        wp.skip = win_skip;
+        wp.lo = win_lo;
         for (int t = 0; t < T && !imgs.empty(); ++t)
             if (in_image(p0 + t)) wp.vl |= 1u << t;
         for (int il = 0; il < g.nl; ++il) {
@@ -4956,7 +5173,7 @@ struct Model::Impl {
                 }
                 for (int t = 0; t < T; ++t) wp.topk[il][t] = cur_topk_n[t];
             }
-            if (wp.async) {
+            if (wp.async && (!wp.skip || il < n_pre)) {   // (the layers whose MoE runs: the service thread's order)
                 wp.seq[il] = ++seq_issued;
                 layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
@@ -5206,7 +5423,8 @@ struct Model::Impl {
             for (int m = 0; m < L0.nm; ++m)
                 if (member(L0, m).dev == di) mi = m;
             if (mi < 0) continue;
-            if (!started) {   // the window's input: the embedding rows, or the previous group's hand-off
+            const bool any = !wp.skip || il <= n_pre;   // (a window before a truncated prompt's tail: to n_pre only)
+            if (!started && any) {   // the window's input: the embedding rows, or the previous group's hand-off
                 started = true;
                 if (il == 0) {
                     CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
@@ -5239,11 +5457,13 @@ struct Model::Impl {
                 }
                 if (x.n > 0) xfer_get(x, sr.x_flag, wp.win, s);
             }
+            if (!any) continue;
             if (mi == 0 && !tap(d, il, T, err)) return false;
             if (!layer(L0, mi, p0, T, wp, err)) return false;
             if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, il, p0, T);
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
-            if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
+            if (last && mi == 0 && il + 1 < g.nl && (!wp.skip || il + 1 <= n_pre))
+                xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
         }
         if (d.grp == devs[(size_t) head_dev].grp && !head_rows_dev(di, T, err)) return false;
         if (!idle_ev.empty()) {   // (its turn over: the expert cache's copies from here, copy_open)
@@ -5275,7 +5495,8 @@ struct Model::Impl {
     }
 
     // layer L0 for the window, as group member mi (its share of the heads, of the output projection and of the FFNs;
-    // the partial sums all-reduced across the group)
+    // the partial sums all-reduced across the group).  A window before a truncated prompt's tail (wp.skip): layer n_pre
+    // its KV source's part alone (layer_chunk's src_only); the tail's: the consumer layers' windows from wp.lo on
     bool layer(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, std::string& err) {
         Layer& l = member(L0, mi);
         Dev& d = devs[(size_t) l.dev];
@@ -5285,6 +5506,8 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        const bool src_only = wp.skip && !l.mtp && l.il == n_pre;
+        const int64_t lo = !wp.skip && !l.mtp && l.il >= n_pre ? wp.lo : 0;
         // Engram
         if (l.eg >= 0) {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
@@ -5309,17 +5532,21 @@ struct Model::Impl {
         // attention
         // (hc_mix + hc_split on st2 beside the attention: the pre norm takes the lagged pre, a_post / a_comb / a_pre are
         // read from the attention's hc_post on - st waits for them there)
-        CK(cudaEventRecord(d.hc_go, s));
-        CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
-        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.st2);
-        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, d.st2);
-        CK(cudaEventRecord(d.hc_done, d.st2));
+        if (!src_only) {
+            CK(cudaEventRecord(d.hc_go, s));
+            CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
+            hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.st2);
+            hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, d.st2);
+            CK(cudaEventRecord(d.hc_done, d.st2));
+        }
         hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         {
             x3::MvJob j[4];
             int nj = 0;
-            j[nj++] = job(l.wq_a, d.x, d.qr, T, D, g.q_lora);
-            j[nj++] = job(l.wkv, d.x, d.kvr, T, D, HD);
+            if (!src_only) {
+                j[nj++] = job(l.wq_a, d.x, d.qr, T, D, g.q_lora);
+                j[nj++] = job(l.wkv, d.x, d.kvr, T, D, HD);
+            }
             if (l.kv_src) j[nj++] = job(l.c_wkv, d.x, d.ckr, T, D, HD);
             if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, d.x, d.cgr, T, D, HD);
             if (!mv_n(d, j, nj, err)) return false;
@@ -5327,8 +5554,8 @@ struct Model::Impl {
         Finish fq;
         fq.w = l.q_norm;
         fq.eps = g.eps;
-        finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
-        if (NHL > 0) {
+        if (!src_only) finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
+        if (NHL > 0 && !src_only) {
             if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
             Finish fr;
             fr.rd = g.rd;
@@ -5340,19 +5567,21 @@ struct Model::Impl {
         // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
         // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
         // that ring and to the whole block, and leaves the ring as it was
-        if (l.mtp) CK(cudaMemcpyAsync(d.ext, l.win, (size_t) g.win * HD * 2, cudaMemcpyDeviceToDevice, s));
-        else ring_to_ext(l.win, d.ext, p0, g.win, HD, s);
-        Finish fk;
-        fk.w = l.kv_norm;
-        fk.eps = g.eps;
-        fk.rd = g.rd;
-        fk.pos = (int) p0;
-        fk.freqs = freqs;
-        fk.quant = 1;
-        fk.dst = d.ext + (size_t) g.win * HD;
-        fk.dst_stride = HD;
-        finish(d.kvr, T, HD, HD, fk, s);
-        if (!l.mtp) ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr);
+        if (!src_only) {
+            if (l.mtp) CK(cudaMemcpyAsync(d.ext, l.win, (size_t) g.win * HD * 2, cudaMemcpyDeviceToDevice, s));
+            else ring_to_ext(l.win, d.ext, p0, g.win, HD, s);
+            Finish fk;
+            fk.w = l.kv_norm;
+            fk.eps = g.eps;
+            fk.rd = g.rd;
+            fk.pos = (int) p0;
+            fk.freqs = freqs;
+            fk.quant = 1;
+            fk.dst = d.ext + (size_t) g.win * HD;
+            fk.dst_stride = HD;
+            finish(d.kvr, T, HD, HD, fk, s);
+            if (!l.mtp) ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr);
+        }
         AttnRows ar;
         for (int t = 0; t < T; ++t) {
             if (l.mtp) {
@@ -5361,7 +5590,8 @@ struct Model::Impl {
                 ar.nsel[t] = T;
                 continue;
             }
-            const int first = (int) std::max<int64_t>(g.win - p0, t + 1);   // ext row of position max(0, p - win + 1)
+            // ext row of position max(0, lo, p - win + 1)
+            const int first = (int) std::max<int64_t>(g.win - p0 + lo, t + 1);
             ar.win0[t] = first;
             ar.nwin[t] = g.win + t - first + 1;
             ar.nsel[t] = 0;
@@ -5419,7 +5649,7 @@ struct Model::Impl {
                                               (size_t) ng * ik_row(), l.dev, err))
                         return false;
                 }
-                if (clen_max > 0) {
+                if (clen_max > 0 && !src_only) {
                     if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
                     Finish fi;
                     fi.rd = g.rd;
@@ -5445,15 +5675,20 @@ struct Model::Impl {
                         }
                         index_score(d.iq, d.iw, nullptr, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, nmax, d.cand,
                                     (int) cand_stride(), g.cand_blk, cl, d.scores, ss, s);
+                        if (index_check)
+                            index_check_rows(d, l.il, d.iq, d.iw, ks.ik[(size_t) l.dev], T, nmax, d.cand, g.cand_blk, cl, ss, s);
                         Rows tr;
                         for (int t = 0; t < T; ++t) {
                             tr.n[t] = wp.cand[l.il][t] * g.cand_blk;
                             tr.k[t] = lim.k[t];
                         }
-                        topk(d.scores, ss, T, tr, d.cand, (int) cand_stride(), g.cand_blk, d.topk, (int) topk_stride(), s);
+                        topk(d.scores, ss, T, tr, d.cand, (int) cand_stride(), g.cand_blk, d.topk, (int) topk_stride(), s,
+                             &d.tks);
                     } else {
                         index_score(d.iq, d.iw, nullptr, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, clen_max, nullptr, 0, 1,
                                     lim, d.scores, ss, s);
+                        if (index_check)
+                            index_check_rows(d, l.il, d.iq, d.iw, ks.ik[(size_t) l.dev], T, clen_max, nullptr, 1, lim, ss, s);
                         if (l.cand_src) {
                             Rows cr;
                             for (int t = 0; t < T; ++t) {
@@ -5463,7 +5698,24 @@ struct Model::Impl {
                             cand_blocks(d.scores, ss, T, cr, g.cand_blk, d.bm, (long long) bm_stride(), d.cand,
                                         (int) cand_stride(), s);
                         }
-                        topk(d.scores, ss, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s);
+                        topk(d.scores, ss, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s, &d.tks);
+                        if (topk_check) {   // (into d.cand's rows past the window's: scratch here)
+                            const size_t nw = (size_t) T * topk_stride();
+                            std::vector<int> tkc_a(nw), tkc_b(nw);
+                            CK(cudaMemcpyAsync(tkc_a.data(), d.topk, nw * 4, cudaMemcpyDeviceToHost, s));
+                            topk(d.scores, ss, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s);
+                            CK(cudaMemcpyAsync(tkc_b.data(), d.topk, nw * 4, cudaMemcpyDeviceToHost, s));
+                            CK(cudaStreamSynchronize(s));
+                            bool bad = false;
+                            for (int t = 0; t < T; ++t)
+                                bad = bad || std::memcmp(tkc_a.data() + (size_t) t * topk_stride(),
+                                                         tkc_b.data() + (size_t) t * topk_stride(), (size_t) lim.k[t] * 4) != 0;
+                            if (bad) ++tkc_bad;
+                            const long long nc = ++tkc_calls;
+                            if (nc % 256 == 0 || bad)
+                                std::fprintf(stderr, "topk check: %lld calls, %lld differed (layer %d, n %d)\n", nc,
+                                             tkc_bad.load(), l.il, lim.n[0]);
+                        }
                     }
                 }
             }
@@ -5499,6 +5751,7 @@ struct Model::Impl {
             for (int t = 0; t < T; ++t) ar.nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][t] : 0;
             ckvp = sr.ckv[(size_t) l.dev];
         }
+        if (src_only) return true;
         if (l.mtp) {   // the block's rows, after the ring's in ext, as every query's selection
             ckv = d.ext + (size_t) g.win * HD;
             iota_rows(d.topk, T, T, (int) topk_stride(), s);
@@ -5866,11 +6119,21 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
     if (p.chunk > 0 && n >= p.chunk_min) return p.forward_chunks(tokens, n, logits_rows, err);   // a long run
     p.logits_all = false;
-    for (int a = 0; a < n; a += kWin) {
-        const int T = std::min(kWin, n - a);
-        if (!p.forward(tokens + a, T, a + T == n ? logits_rows : 0, err)) return false;
+    // (threads mode, Options::prefill_keep's approximate tail: the windows before it end at its start and run the
+    // consumer layers not at all - no drafter seeding from them either; the tail's windows see only the tail there)
+    const int tail = p.par ? p.tail_rows(n) : n;
+    const int64_t lo = tail < n ? p.pos + n - tail : 0;
+    bool ok = true;
+    for (int a = 0; a < n && ok;) {
+        p.win_skip = a < n - tail;
+        p.win_lo = lo;
+        const int T = std::min(kWin, (p.win_skip ? n - tail : n) - a);
+        ok = p.forward(tokens + a, T, a + T == n ? logits_rows : 0, err, p.win_skip ? 0 : -1);
+        a += T;
     }
-    return true;
+    p.win_skip = false;
+    p.win_lo = 0;
+    return ok;
 }
 int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
@@ -5888,10 +6151,27 @@ void Model::set_images(std::vector<Image> images) {
     p_->imgs = std::move(images);
 }
 int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
-bool Model::draft(int y, std::vector<int>& d, std::vector<float>& c, std::string& err) { return p_->draft(y, d, c, err); }
+bool Model::draft(int y, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter, std::vector<int>& d,
+                  std::vector<float>& c, std::string& err) {
+    Impl::Samp sm;
+    sm.temperature = t;
+    sm.top_p = tp;
+    sm.top_k = tk;
+    sm.min_p = mp;
+    sm.seed = seed;
+    sm.counter = counter;
+    return p_->draft(y, sm, d, c, err);
+}
 bool Model::verify(int y, const std::vector<int>& d, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter,
                    int& accepted, int& next, std::string& err) {
-    return p_->verify(y, d, t, tp, tk, mp, seed, counter, accepted, next, err);
+    Impl::Samp sm;
+    sm.temperature = t;
+    sm.top_p = tp;
+    sm.top_k = tk;
+    sm.min_p = mp;
+    sm.seed = seed;
+    sm.counter = counter;
+    return p_->verify(y, d, sm, accepted, next, err);
 }
 int64_t Model::pos() const { return p_->pos; }
 int64_t Model::max_context() const { return p_->o.max_context; }
@@ -5901,6 +6181,8 @@ void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
+void Model::set_prefill_keep(int keep) { p_->o.prefill_keep = keep; }
+void Model::set_draft_sample(int on) { p_->draft_sample = on < 0 ? p_->draft_sample_env : on != 0; }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const { return p_->st; }
 Tiers Model::tiers() const { return p_->tiers(); }
