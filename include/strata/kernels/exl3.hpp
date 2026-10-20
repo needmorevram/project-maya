@@ -87,12 +87,22 @@ int mv_cols(const Mat& m);
 bool prepare(cudaStream_t s);
 
 /// One routed expert's blob: three parts (gate, up, down) at byte offsets from the blob base, each holding the FP16
-/// suh, the FP16 svh and the trellis of that matrix.
+/// suh, the FP16 svh and the trellis of that matrix.  hdr: the blobs come in several layouts (a SAGE pack gives each
+/// matrix its own K) and each opens with its own (BlobHdr, kBlobHdr bytes) - moe_* and win_experts read it there, and
+/// the offsets here are not used (the set_* calls take one layout: theirs is).
 struct ExpertLayout {
     size_t suh[3] = {0, 0, 0}, svh[3] = {0, 0, 0}, trellis[3] = {0, 0, 0};
     int K[3] = {0, 0, 0};
     int cb = 2;
+    int hdr = 0;
 };
+/// A blob's own layout at its first bytes (ExpertLayout::hdr): its parts' pieces as offsets from the blob, their K, the
+/// codebook (mul1 only).
+struct BlobHdr {
+    uint64_t suh[3], svh[3], tr[3];
+    int32_t K[3], cb;
+};
+constexpr size_t kBlobHdr = 256;
 /// The routed experts of one token (the engine's device plan: plan_ptr[i] = the blob in VRAM, 0 = not on the device;
 /// plan_w[i] its weight).  gate/up over x (n_embd F32) -> clamped swiglu -> h (F32 [k][n_ff], scratch the caller
 /// owns), then down over h, the weighted sum in plan order, + cpu_part when *cpu_flag, + sh_out when given -> out.
@@ -157,7 +167,8 @@ struct SetArgs {
     int n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
 };
-/// h[local row] = FP16 clamped swiglu of gate and up over x[row_idx[local row]] (F32 rows, ldx floats apart).
+/// h[local row] = FP16 clamped swiglu of gate and up over x[row_idx[local row]] (F32 rows, ldx floats apart).  Gate and up
+/// may differ in K (1..4 each).
 void set_gate_up(const SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh, cudaStream_t s);
 /// y[local row] = down(h[local row]) (F32 rows, ldy floats apart).
 void set_down(const SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);

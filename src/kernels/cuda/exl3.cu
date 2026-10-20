@@ -556,6 +556,7 @@ struct KMoe {
     int k, n_embd, n_ff;
     float limit;
     const int* skip;     // set_skip's flag (nullptr: none)
+    int hdr;             // each blob's layout its own (BlobHdr): the *_hdr kernels
 };
 
 // the pieces the token's experts (moe_*_kernel) and a window's grouped experts (win_*_kernel) share, so each window
@@ -600,48 +601,79 @@ __device__ __forceinline__ float combine(const float* plan_w, const float* p, in
 // grid (n_ff / 128, k, 2): expert blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values; the pair's
 // second block to finish turns them into the clamped swiglu, in h
 template <int K, int cb>
-__global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_gate_up_kernel(const KMoe a) {
-    __shared__ __align__(16) BlockSmem<K> sm;
-    __shared__ int last;
+__device__ __forceinline__ void moe_gate_up_body(const KMoe& a, BlockSmem<K>& sm, int& last, const uint8_t* blob,
+                                                 size_t tr, size_t suh, size_t svh) {
     const int ei = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
-    const unsigned long long ptr = a.plan_ptr[ei];
-    if (ptr == 0ull) return;
-    if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
-    const uint8_t* blob = (const uint8_t*) ptr;
     const int warp = threadIdx.x >> 5;
     Xin x;
     x.f = a.x;
-    block_gemv<K, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
-                      (const uint16_t*) (blob + a.suh[r]), 1, sm);
+    block_gemv<K, cb>((const uint32_t*) (blob + tr), a.n_ff / 16, g * 8, 0, a.n_embd, x, (const uint16_t*) (blob + suh),
+                      1, sm);
     const size_t row = (size_t) ei * a.n_ff + g * kCols;
-    if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[r]) + g * kCols, (r == 0 ? a.h : a.u) + row);
+    if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + svh) + g * kCols, (r == 0 ? a.h : a.u) + row);
     if (!pair_last(a.cnt_gu + ei * (a.n_ff / kCols) + g, last)) return;
     if (threadIdx.x < kCols)
         a.h[row + threadIdx.x] = swiglu(*(volatile const float*) &a.h[row + threadIdx.x],
                                         *(volatile const float*) &a.u[row + threadIdx.x], a.limit);
 }
+template <int K, int cb>
+__global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_gate_up_kernel(const KMoe a) {
+    __shared__ __align__(16) BlockSmem<K> sm;
+    __shared__ int last;
+    const int r = blockIdx.z;
+    const unsigned long long ptr = a.plan_ptr[blockIdx.y];
+    if (ptr == 0ull) return;
+    if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
+    moe_gate_up_body<K, cb>(a, sm, last, (const uint8_t*) ptr, a.tr[r], a.suh[r], a.svh[r]);
+}
+
+// the blob's own layout (KMoe::hdr): its matrix's K picks the body, the shared memory the largest K's
+#define EXL3_HDR_CASES(BODY, ...)                                                                                     \
+    switch (K) {                                                                                                     \
+        case 1: BODY<1, 2>(__VA_ARGS__, *reinterpret_cast<BlockSmem<1>*>(raw)); break;                                \
+        case 2: BODY<2, 2>(__VA_ARGS__, *reinterpret_cast<BlockSmem<2>*>(raw)); break;                                \
+        case 3: BODY<3, 2>(__VA_ARGS__, *reinterpret_cast<BlockSmem<3>*>(raw)); break;                                \
+        case 4: BODY<4, 2>(__VA_ARGS__, *reinterpret_cast<BlockSmem<4>*>(raw)); break;                                \
+        case 5: BODY<5, 2>(__VA_ARGS__, *reinterpret_cast<BlockSmem<5>*>(raw)); break;                                \
+        case 6: BODY<6, 2>(__VA_ARGS__, *reinterpret_cast<BlockSmem<6>*>(raw)); break;                                \
+        case 7: BODY<7, 2>(__VA_ARGS__, *reinterpret_cast<BlockSmem<7>*>(raw)); break;                                \
+        default: BODY<8, 2>(__VA_ARGS__, *reinterpret_cast<BlockSmem<8>*>(raw)); break;                               \
+    }
+template <int K, int cb>
+__device__ __forceinline__ void moe_gate_up_hdr_body(const KMoe& a, int& last, const uint8_t* blob, size_t tr,
+                                                     size_t suh, size_t svh, BlockSmem<K>& sm) {
+    moe_gate_up_body<K, cb>(a, sm, last, blob, tr, suh, svh);
+}
+__global__ void EXL3_BOUNDS(2) moe_gate_up_hdr_kernel(const KMoe a) {
+    __shared__ __align__(16) unsigned char raw[sizeof(BlockSmem<8>)];
+    __shared__ int last;
+    const int r = blockIdx.z;
+    const unsigned long long ptr = a.plan_ptr[blockIdx.y];
+    if (ptr == 0ull) return;
+    if (a.skip != nullptr && *a.skip) return;
+    const uint8_t* blob = (const uint8_t*) ptr;
+    const BlobHdr* h = (const BlobHdr*) blob;
+    const int K = h->K[r];
+    EXL3_HDR_CASES(moe_gate_up_hdr_body, a, last, blob, (size_t) h->tr[r], (size_t) h->suh[r], (size_t) h->svh[r])
+}
 
 // grid (n_embd / 128, k): expert blockIdx.y's down rows for 128 outputs; the last block of each output block adds
 // the experts up in plan order (as the engine's moe_down), then the CPU lane's part and the shared expert
+// expert blockIdx.y's down rows for the block's 128 outputs into part (the kernels below then add the experts up)
 template <int K, int cb>
-__global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_down_kernel(const KMoe a) {
-    __shared__ __align__(16) BlockSmem<K> sm;
-    __shared__ int last;
+__device__ __forceinline__ void moe_down_rows(const KMoe& a, const uint8_t* blob, size_t tr, size_t suh, size_t svh,
+                                              BlockSmem<K>& sm) {
     const int ei = blockIdx.y, g = blockIdx.x;
-    const unsigned long long ptr = a.plan_ptr[ei];
     const int warp = threadIdx.x >> 5;
-    float* part = a.part + (size_t) ei * a.n_embd + g * kCols;
-    if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
-    if (ptr != 0ull) {
-        const uint8_t* blob = (const uint8_t*) ptr;
-        Xin x;
-        x.f = a.h + (size_t) ei * a.n_ff;
-        block_gemv<K, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
-                          (const uint16_t*) (blob + a.suh[2]), 1, sm);
-        if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[2]) + g * kCols, part);
-    } else if (threadIdx.x < kCols) {
-        part[threadIdx.x] = 0.0f;
-    }
+    Xin x;
+    x.f = a.h + (size_t) ei * a.n_ff;
+    block_gemv<K, cb>((const uint32_t*) (blob + tr), a.n_embd / 16, g * 8, 0, a.n_ff, x, (const uint16_t*) (blob + suh),
+                      1, sm);
+    if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + svh) + g * kCols, a.part + (size_t) ei * a.n_embd + g * kCols);
+}
+// the last block of each output block adds the experts up in plan order, then the CPU lane's part and the shared expert
+__device__ __forceinline__ void moe_down_combine(const KMoe& a, int& last) {
+    const int g = blockIdx.x;
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(&a.cnt[g], 1u) == (unsigned) (a.k - 1);
@@ -656,6 +688,35 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_down_kernel(const KMoe a) {
                            a.sh_out != nullptr ? a.sh_out[r] : 0.0f);
     }
     if (threadIdx.x == 0) a.cnt[g] = 0u;
+}
+template <int K, int cb>
+__global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_down_kernel(const KMoe a) {
+    __shared__ __align__(16) BlockSmem<K> sm;
+    __shared__ int last;
+    const int ei = blockIdx.y, g = blockIdx.x;
+    const unsigned long long ptr = a.plan_ptr[ei];
+    float* part = a.part + (size_t) ei * a.n_embd + g * kCols;
+    if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
+    if (ptr != 0ull) moe_down_rows<K, cb>(a, (const uint8_t*) ptr, a.tr[2], a.suh[2], a.svh[2], sm);
+    else if (threadIdx.x < kCols) part[threadIdx.x] = 0.0f;
+    moe_down_combine(a, last);
+}
+__global__ void EXL3_BOUNDS(2) moe_down_hdr_kernel(const KMoe a) {
+    __shared__ __align__(16) unsigned char raw[sizeof(BlockSmem<8>)];
+    __shared__ int last;
+    const int ei = blockIdx.y, g = blockIdx.x;
+    const unsigned long long ptr = a.plan_ptr[ei];
+    float* part = a.part + (size_t) ei * a.n_embd + g * kCols;
+    if (a.skip != nullptr && *a.skip) return;
+    if (ptr != 0ull) {
+        const uint8_t* blob = (const uint8_t*) ptr;
+        const BlobHdr* h = (const BlobHdr*) blob;
+        const int K = h->K[2];
+        EXL3_HDR_CASES(moe_down_rows, a, blob, (size_t) h->tr[2], (size_t) h->suh[2], (size_t) h->svh[2])
+    } else if (threadIdx.x < kCols) {
+        part[threadIdx.x] = 0.0f;
+    }
+    moe_down_combine(a, last);
 }
 
 // ---------------------------------------------------------------- a verify window's routed experts
@@ -683,17 +744,15 @@ struct KWin {
     size_t suh[3], svh[3], tr[3];
     int k, n_embd, n_ff;
     float limit;
+    int hdr;             // each blob's layout its own (BlobHdr): the *_hdr kernels
 };
 
 // grid (n_ff / 128, groups at most, 2): group blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values of
 // each of its entries, kTok entries a pass; the pair's second block to finish turns them into the clamped swiglu
 template <int K, int cb>
-__global__ void EXL3_BOUNDS(kMinBlocksX<K>) win_gu_kernel(const KWin a) {
-    __shared__ __align__(16) BlockSmem<K> sm;
-    __shared__ int last;
+__device__ __forceinline__ void win_gu_body(const KWin& a, int& last, const uint8_t* blob, size_t tr, size_t suh,
+                                            size_t svh, BlockSmem<K>& sm) {
     const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
-    if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     float* dst = r == 0 ? a.h : a.u;
@@ -701,10 +760,10 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) win_gu_kernel(const KWin a) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
-        block_gemv<K, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
-                          (const uint16_t*) (blob + a.suh[r]), nc, sm);
+        block_gemv<K, cb>((const uint32_t*) (blob + tr), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+                          (const uint16_t*) (blob + suh), nc, sm);
         if (warp < nc)
-            block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
+            block_out(sm.out + warp * kCols, (const uint16_t*) (blob + svh) + g * kCols,
                       dst + (size_t) a.grp_ent[mm + warp] * a.n_ff + g * kCols);
         __syncthreads();
     }
@@ -715,27 +774,59 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) win_gu_kernel(const KWin a) {
             a.h[row] = swiglu(*(volatile const float*) &a.h[row], *(volatile const float*) &a.u[row], a.limit);
         }
 }
+template <int K, int cb>
+__global__ void EXL3_BOUNDS(kMinBlocksX<K>) win_gu_kernel(const KWin a) {
+    __shared__ __align__(16) BlockSmem<K> sm;
+    __shared__ int last;
+    const int grp = blockIdx.y, r = blockIdx.z;
+    if (grp >= *a.n_groups) return;
+    win_gu_body<K, cb>(a, last, (const uint8_t*) a.grp_ptr[grp], a.tr[r], a.suh[r], a.svh[r], sm);
+}
+__global__ void EXL3_BOUNDS(2) win_gu_hdr_kernel(const KWin a) {
+    __shared__ __align__(16) unsigned char raw[sizeof(BlockSmem<8>)];
+    __shared__ int last;
+    const int grp = blockIdx.y, r = blockIdx.z;
+    if (grp >= *a.n_groups) return;
+    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const BlobHdr* h = (const BlobHdr*) blob;
+    const int K = h->K[r];
+    EXL3_HDR_CASES(win_gu_body, a, last, blob, (size_t) h->tr[r], (size_t) h->suh[r], (size_t) h->svh[r])
+}
 
 // grid (n_embd / 128, groups at most): group blockIdx.y's down rows for 128 outputs of each entry into its part rows
 template <int K, int cb>
-__global__ void EXL3_BOUNDS(kMinBlocksX<K>) win_down_kernel(const KWin a) {
-    __shared__ __align__(16) BlockSmem<K> sm;
+__device__ __forceinline__ void win_down_body(const KWin& a, const uint8_t* blob, size_t tr, size_t suh, size_t svh,
+                                              BlockSmem<K>& sm) {
     const int grp = blockIdx.y, g = blockIdx.x;
-    if (grp >= *a.n_groups) return;
-    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
     const int warp = threadIdx.x >> 5;
     const int m0 = a.grp_start[grp], m1 = a.grp_start[grp + 1];
     for (int mm = m0; mm < m1; mm += kTok) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.h + (size_t) a.grp_ent[mm + warp] * a.n_ff;
-        block_gemv<K, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
-                          (const uint16_t*) (blob + a.suh[2]), nc, sm);
+        block_gemv<K, cb>((const uint32_t*) (blob + tr), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+                          (const uint16_t*) (blob + suh), nc, sm);
         if (warp < nc)
-            block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
+            block_out(sm.out + warp * kCols, (const uint16_t*) (blob + svh) + g * kCols,
                       a.part + (size_t) a.grp_ent[mm + warp] * a.n_embd + g * kCols);
         __syncthreads();
     }
+}
+template <int K, int cb>
+__global__ void EXL3_BOUNDS(kMinBlocksX<K>) win_down_kernel(const KWin a) {
+    __shared__ __align__(16) BlockSmem<K> sm;
+    const int grp = blockIdx.y;
+    if (grp >= *a.n_groups) return;
+    win_down_body<K, cb>(a, (const uint8_t*) a.grp_ptr[grp], a.tr[2], a.suh[2], a.svh[2], sm);
+}
+__global__ void EXL3_BOUNDS(2) win_down_hdr_kernel(const KWin a) {
+    __shared__ __align__(16) unsigned char raw[sizeof(BlockSmem<8>)];
+    const int grp = blockIdx.y;
+    if (grp >= *a.n_groups) return;
+    const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
+    const BlobHdr* h = (const BlobHdr*) blob;
+    const int K = h->K[2];
+    EXL3_HDR_CASES(win_down_body, a, blob, (size_t) h->tr[2], (size_t) h->suh[2], (size_t) h->svh[2])
 }
 
 // grid (n_embd / 128, T): each token's outputs, moe_down_kernel's combine (an entry off the device adds 0)
@@ -1066,10 +1157,31 @@ __global__ void __launch_bounds__(kThreads) gemm_kernel(const GArgs a) {
     }
 }
 
-// gate and up (matrices 0 and 1) over the same rows, the clamped swiglu, FP16 h.  grid (row blocks, n / 128, experts)
+// one matrix's tile of slice ks for the warp's 16 columns, into acc (gate_up_kernel's step for each of its two)
 template <int K, int cb>
-__global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
+__device__ __forceinline__ void gu_step(const uint8_t* blob, size_t tr, int ld, int ks, int g, const __half* A, int s,
+                                        uint32_t* stage, float (&acc)[MT][2][4]) {
     constexpr int W = 8 * K;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const uint32_t* src = (const uint32_t*) (blob + tr) + ((size_t) ks * ld + g * 8 + warp) * W;
+    __syncwarp();
+    for (int i = lane; i < W; i += 32) stage[i] = src[i];
+    __syncwarp();
+    uint32_t b[4];
+    tile_frags<K, cb>(stage, lane, b);
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+        uint32_t af[4];
+        a_frags(A, mt, s, lane, af);
+        mma16816(acc[mt][0], af, b[0], b[1]);
+        mma16816(acc[mt][1], af, b[2], b[3]);
+    }
+}
+
+// gate and up (matrices 0 and 1, K KG and KU) over the same rows, the clamped swiglu, FP16 h.  grid (row blocks,
+// n / 128, experts)
+template <int KG, int KU, int cb>
+__global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
     __shared__ __align__(16) unsigned char sm[2 * BM * 128 * 4];   // A_g, A_u, then the two F32 tiles
     __shared__ uint32_t stage[kWarps][64];
     __half* A[2] = {reinterpret_cast<__half*>(sm), reinterpret_cast<__half*>(sm) + BM * AP};
@@ -1089,22 +1201,8 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
 #pragma unroll 1
         for (int s = 0; s < 8; ++s) {
             const int ks = k0 / 16 + s;
-#pragma unroll
-            for (int m = 0; m < 2; ++m) {
-                const uint32_t* src = (const uint32_t*) (blob + a.tr[m]) + ((size_t) ks * a.ld[m] + g * 8 + warp) * W;
-                __syncwarp();
-                for (int i = lane; i < W; i += 32) stage[warp][i] = src[i];
-                __syncwarp();
-                uint32_t b[4];
-                tile_frags<K, cb>(stage[warp], lane, b);
-#pragma unroll
-                for (int mt = 0; mt < MT; ++mt) {
-                    uint32_t af[4];
-                    a_frags(A[m], mt, s, lane, af);
-                    mma16816(acc[m][mt][0], af, b[0], b[1]);
-                    mma16816(acc[m][mt][1], af, b[2], b[3]);
-                }
-            }
+            gu_step<KG, cb>(blob, a.tr[0], a.ld[0], ks, g, A[0], s, stage[warp], acc[0]);
+            gu_step<KU, cb>(blob, a.tr[1], a.ld[1], ks, g, A[1], s, stage[warp], acc[1]);
         }
     }
     __syncthreads();
@@ -1190,9 +1288,18 @@ template <int K, int cb> struct RunGemm {
 };
 template <int K, int cb> struct RunGateUp {
     static void run(const tc::GArgs& a, dim3 grid, cudaStream_t s) {
-        tc::gate_up_kernel<K, cb><<<grid, kThreads, 0, s>>>(a);
+        tc::gate_up_kernel<K, K, cb><<<grid, kThreads, 0, s>>>(a);
     }
 };
+// a gate and an up of other K (a SAGE pack's), 1..4 each, mul1
+bool gate_up_mixed(int kg, int ku, const tc::GArgs& a, dim3 grid, cudaStream_t s) {
+#define EXL3_GU2(G, U) \
+    if (kg == G && ku == U) return tc::gate_up_kernel<G, U, 2><<<grid, kThreads, 0, s>>>(a), true;
+    EXL3_GU2(1, 2) EXL3_GU2(1, 3) EXL3_GU2(1, 4) EXL3_GU2(2, 1) EXL3_GU2(2, 3) EXL3_GU2(2, 4)
+    EXL3_GU2(3, 1) EXL3_GU2(3, 2) EXL3_GU2(3, 4) EXL3_GU2(4, 1) EXL3_GU2(4, 2) EXL3_GU2(4, 3)
+#undef EXL3_GU2
+    return false;
+}
 #endif
 template <int K, int cb> struct RunInnerRows {
     static void run(const Mat& m, uint16_t* dst, cudaStream_t s) {
@@ -1526,6 +1633,11 @@ static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     m.n_ff = a.n_ff;
     m.limit = a.limit;
     m.skip = g_skip;
+    m.hdr = a.lay.hdr;
+    if (m.hdr && a.lay.cb != 2) {
+        std::fprintf(stderr, "exl3 moe: blob headers are covered for the mul1 codebook only\n");
+        return false;
+    }
     return true;
 }
 
@@ -1533,13 +1645,14 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
     EXL3_LEGACY(moe_gate_up(a, x, h, s));
     KMoe m;
     if (!moe_args(a, m, s)) return;
-    if (a.lay.K[0] != a.lay.K[1]) {
+    if (!m.hdr && a.lay.K[0] != a.lay.K[1]) {
         std::fprintf(stderr, "exl3 moe_gate_up: gate K %d != up K %d\n", a.lay.K[0], a.lay.K[1]);
         return;
     }
     m.x = x;
     if (h != nullptr) m.h = h;
-    if (!dispatch<RunGU>(a.lay.K[0], a.lay.cb, m, s)) std::fprintf(stderr, "exl3 moe_gate_up: K %d\n", a.lay.K[0]);
+    if (m.hdr) moe_gate_up_hdr_kernel<<<dim3((unsigned) (m.n_ff / kCols), (unsigned) m.k, 2u), kThreads, 0, s>>>(m);
+    else if (!dispatch<RunGU>(a.lay.K[0], a.lay.cb, m, s)) std::fprintf(stderr, "exl3 moe_gate_up: K %d\n", a.lay.K[0]);
     launch_check("moe_gate_up");
 }
 
@@ -1550,14 +1663,16 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
     if (h != nullptr) m.h = const_cast<float*>(h);
     m.sh_out = sh_out;
     m.out = out;
-    if (!dispatch<RunDown>(a.lay.K[2], a.lay.cb, m, s)) std::fprintf(stderr, "exl3 moe_down: K %d\n", a.lay.K[2]);
+    if (m.hdr) moe_down_hdr_kernel<<<dim3((unsigned) (m.n_embd / kCols), (unsigned) m.k), kThreads, 0, s>>>(m);
+    else if (!dispatch<RunDown>(a.lay.K[2], a.lay.cb, m, s)) std::fprintf(stderr, "exl3 moe_down: K %d\n", a.lay.K[2]);
     launch_check("moe_down");
 }
 
 bool win_experts(const WinArgs& a, cudaStream_t s) {
     EXL3_LEGACY(win_experts(a, s));
     if (a.T < 1 || a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
-        a.n_ff > kMaxMoeK || a.lay.K[0] != a.lay.K[1] || a.h == nullptr || a.part == nullptr || a.out == nullptr) {
+        a.n_ff > kMaxMoeK || (!a.lay.hdr && a.lay.K[0] != a.lay.K[1]) || (a.lay.hdr && a.lay.cb != 2) ||
+        a.h == nullptr || a.part == nullptr || a.out == nullptr) {
         std::fprintf(stderr, "exl3 win_experts: not covered (T %d k %d n_embd %d n_ff %d, gate K %d up K %d)\n", a.T,
                      a.k, a.n_embd, a.n_ff, a.lay.K[0], a.lay.K[1]);
         return false;
@@ -1597,9 +1712,14 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.n_embd = a.n_embd;
     w.n_ff = a.n_ff;
     w.limit = a.limit;
-    if (!dispatch<RunWin>(a.lay.K[0], a.lay.cb, w, groups, s) ||
-        !dispatch<RunWinDown>(a.lay.K[2], a.lay.cb, w, groups, s))
+    w.hdr = a.lay.hdr;
+    if (w.hdr) {
+        win_gu_hdr_kernel<<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(w);
+        win_down_hdr_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads, 0, s>>>(w);
+    } else if (!dispatch<RunWin>(a.lay.K[0], a.lay.cb, w, groups, s) ||
+               !dispatch<RunWinDown>(a.lay.K[2], a.lay.cb, w, groups, s)) {
         return false;
+    }
     if (a.wait_ptr != nullptr) win_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
     win_combine_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s>>>(w);
     launch_check("win_experts");
@@ -1620,8 +1740,8 @@ bool mma_supported() {
 void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s) {
 #if !defined(STRATA_USE_HIP)
-    if (sa.lay.K[0] != sa.lay.K[1]) {
-        std::fprintf(stderr, "exl3 set_gate_up: gate K %d != up K %d\n", sa.lay.K[0], sa.lay.K[1]);
+    if (sa.lay.K[0] != sa.lay.K[1] && sa.lay.cb != 2) {
+        std::fprintf(stderr, "exl3 set_gate_up: gate K %d != up K %d (not mul1)\n", sa.lay.K[0], sa.lay.K[1]);
         g_launch_errors.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -1646,7 +1766,11 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
     a.ldh = ldh;
     a.limit = sa.limit;
     const dim3 grid((unsigned) ((sa.max_rows + tc::BM - 1) / tc::BM), (unsigned) (sa.n_ff / kCols), (unsigned) sa.n_exp);
-    if (!dispatch<RunGateUp>(sa.lay.K[0], sa.lay.cb, a, grid, s)) std::fprintf(stderr, "exl3 set_gate_up: K\n");
+    if (sa.lay.K[0] != sa.lay.K[1] ? !gate_up_mixed(sa.lay.K[0], sa.lay.K[1], a, grid, s)
+                                    : !dispatch<RunGateUp>(sa.lay.K[0], sa.lay.cb, a, grid, s)) {
+        std::fprintf(stderr, "exl3 set_gate_up: gate K %d up K %d\n", sa.lay.K[0], sa.lay.K[1]);
+        g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+    }
     launch_check("set_gate_up");
 #else
     (void) sa; (void) x; (void) ldx; (void) row_idx; (void) h16; (void) ldh; (void) s;
