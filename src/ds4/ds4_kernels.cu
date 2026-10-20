@@ -1511,6 +1511,37 @@ __global__ void ar_sum16_kernel(float4* x, uint2* own, const uint2* __restrict__
         x[q] = from_h4(s16);
     }
 }
+// (the H2D side by the SMs' loads from host memory, the copy engine left to the experts' streaming: a set's sums do
+// not queue behind its batches) - the others' partials of slice [q0, q1) read in place, every member's at once
+__global__ void ar_sum16_zc_kernel(float4* x, uint2* own, const uint2* rows, size_t rstride, int nm, int mi, int q0,
+                                   int q1) {
+    for (int q = q0 + blockIdx.x * blockDim.x + threadIdx.x; q < q1; q += gridDim.x * blockDim.x) {
+        uint2 u[8];
+#pragma unroll
+        for (int m = 0; m < 8; ++m)
+            if (m < nm) u[m] = m == mi ? own[q] : __ldcv(rows + (size_t) m * rstride + q);
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if (m >= nm) break;
+            const float4 p = from_h4(u[m]);
+            if (m == 0) v = p;
+            else {
+                v.x = __fadd_rn(v.x, p.x);
+                v.y = __fadd_rn(v.y, p.y);
+                v.z = __fadd_rn(v.z, p.z);
+                v.w = __fadd_rn(v.w, p.w);
+            }
+        }
+        const uint2 s16 = to_h4(sat4(v));
+        own[q] = s16;
+        x[q] = from_h4(s16);
+    }
+}
+__global__ void ar_from16_zc_kernel(float4* x, const uint2* hsum, int n4, int q0, int q1) {
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
+        if (q < q0 || q >= q1) x[q] = from_h4(__ldcv(hsum + q));
+}
 __global__ void ar_from16_kernel(float4* x, const uint2* __restrict__ h, int n4, int q0, int q1) {
     for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
         if (q < q0 || q >= q1) x[q] = from_h4(h[q]);
@@ -1927,6 +1958,23 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
     if (c1 < n4) cudaMemcpyAsync(hrow(mi) + c1, own + c1, (size_t) (n4 - c1) * 8, cudaMemcpyDeviceToHost, s);
     set_flag_kernel<<<1, 1, 0, s>>>(rf + (size_t) mi * fs, seq);
     wait_flags_kernel<<<1, 32, 0, s>>>(rf, nm, fs, seq);
+    // the H2D side by the SMs up to 4 members (16K-token prompt on 9 GPUs, --tp 4: 743 -> 785 tok/s), the copy
+    // engine past that (--tp 8: 719 by the copy engine, 676 by the SMs); DS4_AR_ZC=0 / 1 / 2.. sets the most members
+    static const int zc_max = [] {
+        const char* e = std::getenv("DS4_AR_ZC");
+        return e != nullptr ? std::atoi(e) : 4;
+    }();
+    if (nm <= std::min(8, zc_max)) {
+        const int nb = std::max(1, std::min(1024, cdiv(c1 - c0, kThreads)));
+        if (c1 > c0) {
+            ar_sum16_zc_kernel<<<nb, kThreads, 0, s>>>((float4*) x, own, hrow(0), a.slots * a.stride / 2, nm, mi, c0, c1);
+            cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDeviceToHost, s);
+        }
+        set_flag_kernel<<<1, 1, 0, s>>>(sf + (size_t) mi * fs, seq);
+        wait_flags_kernel<<<1, 32, 0, s>>>(sf, nm, fs, seq);
+        ar_from16_zc_kernel<<<blocks, kThreads, 0, s>>>((float4*) x, hsum, n4, c0, c1);
+        return;
+    }
     if (c1 > c0) {
         for (int m = 0; m < nm; ++m)
             if (m != mi)

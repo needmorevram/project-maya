@@ -488,6 +488,8 @@ struct Dev {
 
 // the chunked prompt path's buffers on a device: a chunk of C tokens through a layer at once (the attention in slabs of
 // A queries, the indexer in slabs of AI), its GEMMs through FP16 reconstructions of the weights and cuBLAS
+constexpr int kEgSlots = 3;   // a prompt's Engram rows: chunks read ahead (Model::Impl::eg_reader)
+
 struct Chunk {
     int C = 0, A = 0, AI = 0;
     float *h = nullptr, *x = nullptr, *acc = nullptr, *qr = nullptr, *kvr = nullptr, *ckr = nullptr, *cgr = nullptr,
@@ -524,8 +526,7 @@ struct Chunk {
     unsigned arb_seq = 0;        // the group's chunk all-reduces
     // pinned, two chunks in flight: the embedding rows (the first layer's device), the Engram rows (an Engram layer's)
     uint16_t* emb_host[2] = {nullptr, nullptr};
-    uint8_t* eg_host[2] = {nullptr, nullptr};
-    cudaEvent_t emb_ev[2] = {nullptr, nullptr}, eg_ev[2] = {nullptr, nullptr};
+    cudaEvent_t emb_ev[2] = {nullptr, nullptr}, eg_ev[kEgSlots] = {};   // (eg_ev: its copies from each Engram slot)
     double stream_bytes = 0;     // the experts streamed in, in all
 };
 
@@ -1875,11 +1876,27 @@ struct Model::Impl {
             for (int sl = 0; sl < 2; ++sl) {
                 if (d.mi == 0 && (!hmap(c.hand[sl], chunk_hand_bytes(), err) || !hmap(c.hand_flag[sl], 32, err))) return false;
                 if (has_first && !halloc(c.emb_host[sl], C * D, err)) return false;
-                if (has_eg && !halloc(c.eg_host[sl], C * pk.eg_layers * (size_t) cols * (ehd + ehd / 32), err)) return false;
                 CK(cudaEventCreateWithFlags(&c.emb_ev[sl], cudaEventDisableTiming));
-                CK(cudaEventCreateWithFlags(&c.eg_ev[sl], cudaEventDisableTiming));
             }
             if (d.mi == 0 && !hmap(c.hand_ack, (size_t) 2 * 8 * 32, err)) return false;
+            for (int sl = 0; sl < kEgSlots; ++sl) CK(cudaEventCreateWithFlags(&c.eg_ev[sl], cudaEventDisableTiming));
+        }
+        // the prompt's Engram rows: the shared slots, the reader's IO pool (DS4_EG_READERS, 48), the devices that copy
+        eg_copies = 0;
+        eg_devs.clear();
+        for (const Layer& l : L)
+            if (!l.mtp && l.eg >= 0)
+                for (int m = 0; m < l.nm; ++m) {
+                    ++eg_copies;
+                    if (std::find(eg_devs.begin(), eg_devs.end(), member(l, m).dev) == eg_devs.end())
+                        eg_devs.push_back(member(l, m).dev);
+                }
+        if (eg_copies > 0) {
+            const size_t per = (size_t) cols * (ehd + ehd / 32);
+            for (int sl = 0; sl < kEgSlots; ++sl)
+                if (!halloc(eg_shared[sl], (size_t) chunk * pk.eg_layers * per, err)) return false;
+            const char* nr = std::getenv("DS4_EG_READERS");
+            eg_pool = std::make_unique<Pool>(std::max(1, nr != nullptr ? std::atoi(nr) : 48), std::vector<int>{}, 0);
         }
         return true;
     }
@@ -2921,8 +2938,39 @@ struct Model::Impl {
     }
 
     // ---- Engram: the window's rows of both tables, read on the host
-    std::mutex eg_mu;   // (the chunks' threads read Engram rows on the last pool, one at a time)
-    void engram_rows(int64_t p0, int T, int only = -1, uint8_t* dst = nullptr) {
+    // a prompt's (the chunked path): every chunk's rows of each Engram layer read once, ahead of the layers, by a
+    // reader thread on an IO pool of its own (deep queues for the NVMe) into kEgSlots shared pinned slots
+    // ([layer][chunk rows][per]); a device waits only before its Engram layer, and a slot is read again once every
+    // copy from it is done (eg_used: the copies issued, each device's eg_ev[slot] after its last)
+    uint8_t* eg_shared[kEgSlots] = {};
+    std::unique_ptr<Pool> eg_pool;
+    std::atomic<int> eg_read{0};
+    std::atomic<int> eg_used[kEgSlots] = {};
+    std::atomic<bool> eg_abort{false};   // (the devices' run over: a failed one leaves copies that never come)
+    int eg_copies = 0;                 // copies a chunk (an Engram layer's group members, every layer)
+    std::vector<int> eg_devs;          // the devices that copy
+    void eg_reader(const std::vector<int64_t>& p0, const std::vector<int>& T) {
+        const size_t per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
+        for (size_t k = 0; k < T.size(); ++k) {
+            const int sl = (int) (k % kEgSlots);
+            if (k >= (size_t) kEgSlots) {   // (chunk k - kEgSlots's copies issued, then done)
+                const int want = eg_copies * (int) (k / kEgSlots);
+                while (eg_used[sl].load(std::memory_order_acquire) < want) {
+                    if (eg_abort.load(std::memory_order_acquire)) return;
+                    std::this_thread::sleep_for(std::chrono::microseconds(200));
+                }
+                for (int di : eg_devs) {
+                    cudaSetDevice(devs[(size_t) di].id);
+                    cudaEventSynchronize(chunks[(size_t) di]->eg_ev[sl]);
+                }
+            }
+            for (int li = 0; li < pk.eg_layers; ++li)
+                engram_rows(p0[k], T[k], li, eg_shared[sl] + (size_t) li * chunk * per, eg_pool.get());
+            eg_read.store((int) k + 1, std::memory_order_release);
+        }
+    }
+    std::mutex eg_mu;   // (the decode's windows read Engram rows on the last pool, one at a time)
+    void engram_rows(int64_t p0, int T, int only = -1, uint8_t* dst = nullptr, Pool* pool = nullptr) {
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads, hd = pk.eg_hd;
         const size_t per = (size_t) cols * (hd + hd / 32);
         struct Read {
@@ -2966,11 +3014,16 @@ struct Model::Impl {
                 }
             }
         }
-        std::lock_guard<std::mutex> lk(eg_mu);
-        pools.back()->run((int) reads.size(), [&](int i) {
+        auto one = [&](int i) {
             const Read& r = reads[(size_t) i];
             pk.read_at(r.t->file, r.off, r.n, r.dst);
-        });
+        };
+        if (pool != nullptr) {
+            pool->run((int) reads.size(), one);
+            return;
+        }
+        std::lock_guard<std::mutex> lk(eg_mu);
+        pools.back()->run((int) reads.size(), one);
     }
 
     // ---- the CPU lane: a window's routed experts that live on the host, as entries (an expert and up to 8 of its
@@ -3683,10 +3736,17 @@ struct Model::Impl {
         if (l.eg >= 0) {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
-            const int slot = wp.k % 2;   // (read ahead by run_dev_chunks: two chunks' in flight)
-            uint8_t* host = c.eg_host[slot] + (size_t) l.eg * c.C * per;
+            const int slot = wp.k % kEgSlots;   // (read ahead by eg_reader)
+            if (eg_read.load(std::memory_order_acquire) <= wp.k) {
+                const double te = now_ms();
+                while (eg_read.load(std::memory_order_acquire) <= wp.k)
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                if (mi == 0) st.engram_ms += now_ms() - te;
+            }
+            uint8_t* host = eg_shared[slot] + (size_t) l.eg * chunk * per;
             CK(cudaMemcpyAsync(c.eg_rows, host, (size_t) T * per, cudaMemcpyHostToDevice, s));
             CK(cudaEventRecord(c.eg_ev[slot], s));
+            eg_used[slot].fetch_add(1, std::memory_order_acq_rel);
             for (int s0 = 0; s0 < T; s0 += 256) {
                 const int ns = std::min(256, T - s0);
                 engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s);
@@ -4010,30 +4070,10 @@ struct Model::Impl {
             }
         } ra_join{ra_stop, ra};
         if (!copy_ahead(d, c, S, di, err)) return false;
-        // this device's Engram layers: chunk k's rows read on a helper thread while chunk k - 1 runs (slot k % 2, once
-        // chunk k - 2's copy of it is done)
-        std::vector<int> egs;
-        for (const Layer& l0 : L)
-            for (int m = 0; m < l0.nm; ++m)
-                if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0) egs.push_back(l0.eg);
-        const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
-        auto read_eg = [this, &c, &run, &egs, eg_per](int k) {
-            if (k >= 2) cudaEventSynchronize(c.eg_ev[k % 2]);
-            for (int li : egs)
-                engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[k % 2] + (size_t) li * c.C * eg_per);
-        };
-        std::future<void> eg_next;
-        if (!egs.empty()) eg_next = std::async(std::launch::async, read_eg, 0);
         for (int k = 0; k < nk; ++k) {
             const int64_t p0 = run.p0[(size_t) k];
             const int T = run.T[(size_t) k], slot = k % 2;
             const bool last_k = k + 1 == nk;
-            if (!egs.empty()) {   // chunk k's rows ready, chunk k + 1's on their way
-                const double te = now_ms();
-                eg_next.get();
-                if (d.mi == 0) st.engram_ms += now_ms() - te;
-                if (k + 1 < nk) eg_next = std::async(std::launch::async, read_eg, k + 1);
-            }
             WinPlan wp;
             wp.par = true;
             wp.async = true;
@@ -4172,6 +4212,17 @@ struct Model::Impl {
             for (size_t i = 0; i < chunk_done.size(); ++i) chunk_rec[i].store(0);
         }
         std::vector<std::string> errs(devs.size());
+        eg_read.store(0);
+        eg_abort.store(false);
+        for (auto& u : eg_used) u.store(0);
+        std::thread egr;
+        if (eg_copies > 0) egr = std::thread([this, &run] { eg_reader(run.p0, run.T); });
+        struct JoinEg {   // (every way out: the reader done first - it waits only for copies the devices issue)
+            std::thread& th;
+            ~JoinEg() {
+                if (th.joinable()) th.join();
+            }
+        } eg_join{egr};
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
@@ -4188,7 +4239,10 @@ struct Model::Impl {
                 if (reported > 0 && reported < run.T.size())
                     progress(run.p0[reported - 1] + run.T[reported - 1] - run.p0[0]);
             }
-            if (all) break;
+            if (all) {
+                eg_abort.store(true, std::memory_order_release);
+                break;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         for (const std::string& e : errs)
