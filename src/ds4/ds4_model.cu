@@ -530,6 +530,12 @@ struct Chunk {
     cudaStream_t ar_s = nullptr;
     ArAux ar_aux2;
     cudaEvent_t ar_go = nullptr, ar_done = nullptr;
+    // the MoE's sum in kPendRanges row ranges on ar_s, the next layer here taking each range's residual (and its
+    // first, row-wise steps) as it comes: pend while that is owed, pend_ev a range's sum done
+    static constexpr int kPendRanges = 4;
+    bool pend = false;
+    int pend_T = 0;
+    cudaEvent_t pend_ev[kPendRanges] = {};
     // pinned, two chunks in flight: the embedding rows (the first layer's device), the Engram rows (an Engram layer's)
     uint16_t* emb_host[2] = {nullptr, nullptr};
     cudaEvent_t emb_ev[2] = {nullptr, nullptr}, eg_ev[kEgSlots] = {};   // (eg_ev: its copies from each Engram slot)
@@ -1905,6 +1911,7 @@ struct Model::Impl {
             for (cudaEvent_t& e : c.ar_aux2.ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&c.ar_go, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&c.ar_done, cudaEventDisableTiming));
+            for (cudaEvent_t& e : c.pend_ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         }
         // the prompt's Engram rows: the shared slots, the reader's IO pool (DS4_EG_READERS, 48), the devices that copy
         eg_copies = 0;
@@ -3758,7 +3765,30 @@ struct Model::Impl {
         else allreduce(buf, n, ab, mi, ++c.arb_seq, d.xcnt, s);
     }
 
-    bool layer_chunk(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err) {
+    // the MoE's sum owed by the layer before (Chunk::pend): range r's rows [r0, r1) once its sum is in - the residual
+    // and pre, from that layer's f_post / f_comb / f_pre
+    void pend_range(Chunk& c, int r, int& r0, int& r1) const {
+        r0 = (int) ((int64_t) c.pend_T * r / Chunk::kPendRanges);
+        r1 = (int) ((int64_t) c.pend_T * (r + 1) / Chunk::kPendRanges);
+    }
+    void pend_take(Chunk& c, int r, cudaStream_t s) {
+        const int D = g.dim, H = g.hc;
+        int r0, r1;
+        pend_range(c, r, r0, r1);
+        cudaStreamWaitEvent(s, c.pend_ev[r], 0);
+        if (r1 <= r0) return;
+        hc_post_inplace(c.acc + (size_t) r0 * D, c.h + (size_t) r0 * H * D, c.f_post + (size_t) r0 * 8,
+                        c.f_comb + (size_t) r0 * 64, D, H, r1 - r0, s);
+        cudaMemcpyAsync(c.pre + (size_t) r0 * 8, c.f_pre + (size_t) r0 * 8, (size_t) (r1 - r0) * 8 * 4,
+                        cudaMemcpyDeviceToDevice, s);
+    }
+    void pend_finish(Chunk& c, cudaStream_t s) {
+        if (!c.pend) return;
+        for (int r = 0; r < Chunk::kPendRanges; ++r) pend_take(c, r, s);
+        c.pend = false;
+    }
+    bool layer_chunk(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err,
+                     bool defer = false) {
         Layer& l = member(L0, mi);
         Dev& d = devs[(size_t) l.dev];
         Chunk& c = *chunks[(size_t) l.dev];
@@ -3768,6 +3798,10 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ab = groups[(size_t) L0.grp].arb;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        // the residual the layer before owes: by ranges beside the attention's first, row-wise steps below, or (an
+        // Engram layer: its gate reads the whole residual first) whole now
+        const bool by_range = c.pend && l.eg < 0 && c.pend_T == T;
+        if (!by_range) pend_finish(c, s);
         // Engram, in slabs of 256 tokens
         if (l.eg >= 0) {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
@@ -3791,21 +3825,40 @@ struct Model::Impl {
                 engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
             }
         }
-        // attention
-        if (!hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err)) return false;
-        hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
-        hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
-        x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
-        if (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
-            !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err))
+        // attention: the row-wise first steps (rows [r0, r0 + n))
+        auto first_steps = [&](int r0, int n) -> bool {
+            const size_t a = (size_t) r0;
+            if (!hc_mix_chunk(d, c, c.h + a * H * D, l.hca_fn, n, c.mix + a * 32, err)) return false;
+            hc_split(c.mix + a * 32, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, n, c.a_pre + a * 8,
+                     c.a_post + a * 8, c.a_comb + a * 64, s);
+            hc_pre_norm(c.h + a * H * D, c.pre + a * 8, l.attn_norm, D, H, n, g.eps, c.x + a * D, s);
+            x3::rows_f16(c.x + a * D, D, nullptr, n, D, c.x16 + a * D, s);
+            if (!gemm(d, c, l.wq_a, c.x16 + a * D, D, n, c.qr + a * g.q_lora, g.q_lora, 0.0f, err) ||
+                !gemm(d, c, l.wkv, c.x16 + a * D, D, n, c.kvr + a * HD, HD, 0.0f, err))
+                return false;
+            if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16 + a * D, D, n, c.ckr + a * HD, HD, 0.0f, err)) return false;
+            if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16 + a * D, D, n, c.cgr + a * HD, HD, 0.0f, err))
+                return false;
+            Finish fq;
+            fq.w = l.q_norm;
+            fq.eps = g.eps;
+            finish(c.qr + a * g.q_lora, n, g.q_lora, g.q_lora, fq, s);
+            x3::rows_f16(c.qr + a * g.q_lora, g.q_lora, nullptr, n, g.q_lora, c.qr16 + a * g.q_lora, s);
+            return true;
+        };
+        if (by_range) {   // each range once its sum is in (the later ones' sums beside these steps)
+            static const bool serial = std::getenv("DS4_DEFER_SERIAL") != nullptr;   // (a test: every sum first)
+            if (serial)
+                for (int r = 0; r < Chunk::kPendRanges; ++r) cudaStreamWaitEvent(s, c.pend_ev[r], 0);
+            for (int r = 0; r < Chunk::kPendRanges; ++r) {
+                int r0, r1;
+                pend_range(c, r, r0, r1);
+                pend_take(c, r, s);
+                if (r1 > r0 && !first_steps(r0, r1 - r0)) return false;
+            }
+            c.pend = false;
+        } else if (!first_steps(0, T))
             return false;
-        if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16, D, T, c.ckr, HD, 0.0f, err)) return false;
-        if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16, D, T, c.cgr, HD, 0.0f, err)) return false;
-        Finish fq;
-        fq.w = l.q_norm;
-        fq.eps = g.eps;
-        finish(c.qr, T, g.q_lora, g.q_lora, fq, s);
-        x3::rows_f16(c.qr, g.q_lora, nullptr, T, g.q_lora, c.qr16, s);
         // the window rows: the ring's (positions p0 - win ..) then the chunk's
         ring_to_ext(l.win, c.ext, p0, g.win, HD, s);
         Finish fk;
@@ -4052,6 +4105,19 @@ struct Model::Impl {
             v_done = v_to;
         }
         if (!run_set(d, c, l, l.vram_base, 0, unit(l), c.bounds, b.data(), v_done, L0.n_slots, T, err)) return false;
+        if (defer && slab_ar) {   // the sum by ranges on ar_s; the next layer (here) takes each as it comes
+            CK(cudaEventRecord(c.ar_go, s));
+            CK(cudaStreamWaitEvent(c.ar_s, c.ar_go, 0));
+            c.pend_T = T;
+            for (int r = 0; r < Chunk::kPendRanges; ++r) {
+                int r0, r1;
+                pend_range(c, r, r0, r1);
+                if (r1 > r0) chunk_allreduce_on(d, c, ab, mi, c.acc + (size_t) r0 * D, (r1 - r0) * D, c.ar_s, c.ar_aux2);
+                CK(cudaEventRecord(c.pend_ev[r], c.ar_s));
+            }
+            c.pend = true;
+            return true;
+        }
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -4187,6 +4253,7 @@ struct Model::Impl {
                 if (last_k && mi == 0 && g.n_mtp > 0) {   // the drafter's taps: the last chunk's last rows
                     const auto it = std::find(g.d_targets.begin(), g.d_targets.end(), il);
                     if (it != g.d_targets.end()) {
+                        pend_finish(c, s);   // (the residual the layer before owes, first)
                         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
                         const int nr = std::min(T, tap_cap);
                         hc_mean(c.h + (size_t) (T - nr) * H * D, nr, H, D, d.tap, D, s);
@@ -4195,9 +4262,16 @@ struct Model::Impl {
                                              (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
                 }
-                if (!layer_chunk(L0, mi, p0, T, wp, S, err)) return false;
-                if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
                 const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
+                // DS4_AR_DEFER=1: the MoE's sum by ranges beside the next layer's first steps (off: +0-2% on the
+                // 16K-token prompt, and those steps' GEMMs on a range's rows round their sums otherwise - perplexity
+                // on 4 x 1024 tokens at --tp 4 7.5141 with it, 7.4993 without)
+                static const bool defer_ok = [] {
+                    const char* e = std::getenv("DS4_AR_DEFER");
+                    return e != nullptr && std::atoi(e) != 0;
+                }();
+                if (!layer_chunk(L0, mi, p0, T, wp, S, err, defer_ok && !last && dump_l == nullptr)) return false;
+                if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
                 if (last && mi == 0 && il + 1 < g.nl) {   // the hand-off, once the next group took the chunk before last
                     const int nnext = L[(size_t) il + 1].nm;
                     if (k >= 2) wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
