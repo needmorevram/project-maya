@@ -6456,6 +6456,7 @@ struct Model::Impl {
             t.cpu += l.n_exp - l.n_vram;
             for (int e = 0; e < l.n_exp; ++e) (l.slot[(size_t) e] >= 0 ? t.vram_gb : t.cpu_gb) += xc(l, e).blob / 1e9;
         }
+        t.in_place = file_experts;
         return t;
     }
 
@@ -6463,11 +6464,14 @@ struct Model::Impl {
         std::vector<std::string> v;
         const Tiers t = tiers();
         char b[512];
+        // (in place: the CPU lane's experts in the model's files, the page cache keeping what fits - none pinned:
+        // ram_slots / ram_gb 0, their bytes as file_gb)
         std::snprintf(b, sizeof b, "INFO context=%lld kv=fp4 kv_resident=%lld expert_slots=%lld engine_kind=ds4 "
                                    "cpu_experts=%lld experts=%d ram_slots=%lld vram_gb=%.1f ram_gb=%.1f mtp=%d cpu_threads=%d "
-                                   "engine=ds4-0.1",
+                                   "experts_in_place=%d file_gb=%.1f engine=ds4-0.1",
                       (long long) o.max_context, (long long) o.max_context, (long long) t.slots, (long long) t.cpu,
-                      g.nl * g.n_exp, (long long) t.cpu, t.vram_gb, t.cpu_gb, g.n_mtp > 0 ? 1 : 0, cpu_threads());
+                      g.nl * g.n_exp, t.in_place ? 0ll : (long long) t.cpu, t.vram_gb, t.in_place ? 0.0 : t.cpu_gb,
+                      g.n_mtp > 0 ? 1 : 0, cpu_threads(), t.in_place ? 1 : 0, t.in_place ? t.cpu_gb : 0.0);
         v.push_back(b);
         // the Monitor's map of each GPU (serve/gpu_map.py, the GLM engine's VRAM lines): what each part holds on the
         // card, in bytes - the dense weights (the drafter's blocks apart), the KV caches, the window's buffers, the

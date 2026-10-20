@@ -491,7 +491,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f\n",
                             n / el, 1000.0 * el / n, ex > 0 ? 1.0 - (double) cx / (double) ex : 1.0, (double) cx / n,
                             (double) (sn.swaps - sd.swaps) / n, (long long) ti.vram, (long long) ti.slots,
-                            (long long) ti.cpu, (long long) ti.cpu, ti.cpu_gb, ti.vram_gb);
+                            ti.in_place ? 0ll : (long long) ti.cpu, ti.in_place ? 0ll : (long long) ti.cpu,
+                            ti.in_place ? 0.0 : ti.cpu_gb, ti.vram_gb);   // (in place: none pinned - the SSD's)
             }
             std::fflush(stdout);
             bool end = false;

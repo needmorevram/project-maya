@@ -741,7 +741,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEa
   }
   spark("sp-disk", h.disk_read_mb);
   setMetric("ram", hw.ram_used == null ? null : gb(hw.ram_used), hw.ram_total ? `/ ${gb(hw.ram_total, 0)} GB` : "GB",
-            eng.ram_gb ? `${fmt(+eng.ram_gb, 1)} GB pinned for experts` : "");
+            eng.ram_gb && +eng.ram_gb ? `${fmt(+eng.ram_gb, 1)} GB pinned for experts`
+            : +eng.experts_in_place ? `${fmt(+eng.file_gb, 1)} GB of experts read in place from the SSD` : "");
   spark("sp-ram", h.ram_used, hw.ram_total);
 
   // recent requests

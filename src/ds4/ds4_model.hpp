@@ -72,6 +72,7 @@ struct Stats {
 struct Tiers {
     int64_t vram = 0, slots = 0, cpu = 0;
     double vram_gb = 0.0, cpu_gb = 0.0;
+    bool in_place = false;   // the CPU lane's experts read in place from the model's files (none pinned in RAM)
 };
 
 class Model {
