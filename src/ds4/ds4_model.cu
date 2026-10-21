@@ -2366,9 +2366,11 @@ struct Model::Impl {
             rs_th = std::thread([this] { rs_loop(); });
         }
         if (o.cache_bonus != 0.0f)
-            std::fprintf(stderr, "ds4: cache-aware routing (--cache-routing %g,%d): a routed expert in VRAM gets %g added to "
-                                 "its score for decode's picks from pick %d on - approximate, the model's text changes\n",
-                         (double) o.cache_bonus, o.cache_keep, (double) o.cache_bonus, o.cache_keep + 1);
+            std::fprintf(stderr, "ds4: cache-aware routing (--cache-routing %g,%d%s): a routed expert in VRAM gets %g%s added "
+                                 "to its score for decode's picks from pick %d on - approximate, the model's text changes\n",
+                         (double) std::fabs(o.cache_bonus), o.cache_keep, o.cache_bonus < 0.0f ? ",r" : "",
+                         (double) std::fabs(o.cache_bonus), o.cache_bonus < 0.0f ? " times its own score" : "",
+                         o.cache_keep + 1);
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         reset();
         return true;
