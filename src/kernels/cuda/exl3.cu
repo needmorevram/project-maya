@@ -855,14 +855,25 @@ __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
 
+// the device's time in win_wait (ns, globaltimer), its calls and the ones that had to wait (win_wait_stats)
+__device__ unsigned long long g_win_wait_ns = 0, g_win_wait_calls = 0, g_win_wait_stalls = 0;
+
 __global__ void win_wait_kernel(const unsigned* p, unsigned v) {
     if (threadIdx.x != 0) return;
+    unsigned long long t0, t1;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    bool stalled = false;
     while (*(volatile const unsigned*) p != v) {
+        stalled = true;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
     }
     __threadfence_system();
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+    atomicAdd(&g_win_wait_ns, t1 - t0);
+    atomicAdd(&g_win_wait_calls, 1ull);
+    if (stalled) atomicAdd(&g_win_wait_stalls, 1ull);
 }
 
 // ---------------------------------------------------------------- reconstruction
@@ -1751,6 +1762,12 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     win_combine_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s>>>(w);
     launch_check("win_experts");
     return true;
+}
+
+void win_wait_stats(unsigned long long& ns, unsigned long long& calls, unsigned long long& stalls) {
+    cudaMemcpyFromSymbol(&ns, g_win_wait_ns, sizeof ns);
+    cudaMemcpyFromSymbol(&calls, g_win_wait_calls, sizeof calls);
+    cudaMemcpyFromSymbol(&stalls, g_win_wait_stalls, sizeof stalls);
 }
 
 bool mma_supported() {

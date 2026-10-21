@@ -1921,14 +1921,35 @@ __global__ void publish_kernel(Req* req, int T, unsigned seq) {
     *(volatile unsigned*) &req->seq = seq;
 }
 
+// the device's time in wait_seq (ns, globaltimer), its calls and the ones that found the answer not there yet
+// (wait_seq_stats: how long the GPU stood still for the CPU lane)
+__device__ unsigned long long g_wait_ns = 0, g_wait_calls = 0, g_wait_stalls = 0;
+
+__device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
 __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
     if (threadIdx.x != 0) return;
+    const unsigned long long t0 = global_ns();
+    bool stalled = false;
     while (*(volatile const unsigned*) seq_ptr != seq) {
+        stalled = true;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
     }
     __threadfence_system();
+    atomicAdd(&g_wait_ns, global_ns() - t0);
+    atomicAdd(&g_wait_calls, 1ull);
+    if (stalled) atomicAdd(&g_wait_stalls, 1ull);
+}
+
+__global__ void add_cpu_part_kernel(float* sum, const float* part, size_t part_stride, const int* flag, int D) {
+    const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < D && flag[t]) sum[(size_t) t * D + i] += part[(size_t) t * part_stride + i];
 }
 
 __global__ void init_pre_kernel(float* pre, int T) {
@@ -2330,6 +2351,14 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     if (req != nullptr) publish_kernel<<<1, 1, 0, s>>>(req, T, seq);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
+void add_cpu_part(float* sum, const float* part, size_t part_stride, const int* flag, int T, int D, cudaStream_t s) {
+    add_cpu_part_kernel<<<dim3((unsigned) cdiv(D, 256), (unsigned) T), 256, 0, s>>>(sum, part, part_stride, flag, D);
+}
+void wait_seq_stats(unsigned long long& ns, unsigned long long& calls, unsigned long long& stalls) {
+    cudaMemcpyFromSymbol(&ns, g_wait_ns, sizeof ns);
+    cudaMemcpyFromSymbol(&calls, g_wait_calls, sizeof calls);
+    cudaMemcpyFromSymbol(&stalls, g_wait_stalls, sizeof stalls);
+}
 void init_pre(float* pre, int T, cudaStream_t s) { init_pre_kernel<<<cdiv(T * 8, 128), 128, 0, s>>>(pre, T); }
 
 void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {

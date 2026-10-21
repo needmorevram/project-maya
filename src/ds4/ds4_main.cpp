@@ -35,6 +35,23 @@
 #include <thread>
 #include <vector>
 
+namespace strata::ds4 {
+void wait_seq_stats(unsigned long long& ns, unsigned long long& calls, unsigned long long& stalls);   // (ds4_kernels.cu)
+}
+namespace strata::kernels::exl3 {
+void win_wait_stats(unsigned long long& ns, unsigned long long& calls, unsigned long long& stalls);   // (exl3.cu)
+}
+
+namespace {
+// the device's waits for the CPU lane so far, both kinds (a token's wait_seq, a window's win_wait): ns, calls, stalls
+void lane_wait_stats(unsigned long long& ns, unsigned long long& calls, unsigned long long& stalls) {
+    unsigned long long a = 0, b = 0, c = 0;
+    strata::ds4::wait_seq_stats(ns, calls, stalls);
+    strata::kernels::exl3::win_wait_stats(a, b, c);
+    ns += a, calls += b, stalls += c;
+}
+}  // namespace
+
 namespace {
 
 double now_ms() {
@@ -321,6 +338,9 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min) {
     std::vector<int> eos = parse_ids(eos_list);
+    // DS4_SERVE_PROF=1: after each request a "prof:" line - the decode's rounds, drafts, and where a fed position's
+    // time went (the device's waits for the CPU lane among it), and the drafter's round times by window size
+    const bool prof = std::getenv("DS4_SERVE_PROF") != nullptr;
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
@@ -466,6 +486,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.checkpoint(0);
         const double t1 = now_ms();
         const strata::ds4::Stats sd = m.stats();   // (the decode's own counters: STAT lines, DONE's hit fields)
+        unsigned long long w0_ns = 0, w0_calls = 0, w0_stalls = 0;
+        if (prof) lane_wait_stats(w0_ns, w0_calls, w0_stalls);
+        long long rounds = 0;
         long long produced = 0, next_stat = 8;
         const char* finish = "length";
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
@@ -517,6 +540,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
                 d_off += off;
                 d_acc += acc;
+                ++rounds;
                 cool = try_spec && off == 0;
                 std::reverse(got.begin(), got.end());
             }
@@ -540,6 +564,29 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
                      s.experts > s0.experts ? 100.0 * (double) (s.cpu_experts - s0.cpu_experts) / (double) (s.experts - s0.experts)
                                             : 0.0);
+        if (prof && produced > 1) {
+            unsigned long long w_ns = 0, w_calls = 0, w_stalls = 0;
+            lane_wait_stats(w_ns, w_calls, w_stalls);
+            const double fed = (double) std::max<int64_t>(1, se.tokens - sd.tokens), nr = (double) std::max(1LL, rounds);
+            const double dec = t2 - t1, wait_ms = (double) (w_ns - w0_ns) / 1e6;
+            std::fprintf(stderr,
+                         "prof: %lld tokens in %lld rounds (%.2f a round), drafts %lld of %lld kept; a round %.2f ms: "
+                         "drafting %.2f, verify windows %.2f (all %.0f ms); fed %.0f positions (%.2f a token); per fed "
+                         "position: layers %.2f ms, CPU lane %.2f, head wait %.2f, Engram %.2f; the GPU's waits for the "
+                         "CPU lane %.0f ms = %.1f%% of the decode (%.2f ms a round; %llu of %llu waits stalled); CPU lane "
+                         "experts %.2f a token, %.2f a fed position; RAM tier experts %.2f a token; cache fills %.2f a "
+                         "token\n",
+                         produced, rounds, (double) produced / nr, d_acc, d_off, dec / nr,
+                         (se.draft_ms - sd.draft_ms) / nr, (se.verify_ms - sd.verify_ms) / nr, se.verify_ms - sd.verify_ms,
+                         fed, fed / (double) produced, (se.layer_ms - sd.layer_ms) / fed, (se.cpu_ms - sd.cpu_ms) / fed,
+                         (se.head_ms - sd.head_ms) / fed, (se.engram_ms - sd.engram_ms) / fed, wait_ms,
+                         dec > 0 ? 100.0 * wait_ms / dec : 0.0, wait_ms / nr, w_stalls - w0_stalls, w_calls - w0_calls,
+                         (double) (se.cpu_experts - sd.cpu_experts) / (double) produced,
+                         (double) (se.cpu_experts - sd.cpu_experts) / fed,
+                         (double) (se.rt_experts - sd.rt_experts) / (double) produced,
+                         (double) (se.swaps - sd.swaps) / (double) produced);
+            if (rounds > 0) draft_policy.report();
+        }
         m.save_profile();
     }
     m.save_profile();

@@ -223,7 +223,14 @@ struct Resp {
     // a one-GPU window's CPU-lane experts the GPU takes (dstream): pick (t, i)'s blob in the ring (0: not one), its weight
     unsigned long long ds_ptr[kWin][kPicks];
     float ds_w[kWin][kPicks];
+    // (DS4_RT_SPLIT) ds_ptr / ds_w hold the GPU's share of the RAM tier's experts (their pinned blobs) once this is the
+    // request's seq - written before the CPU lane starts on the rest, so the device runs its share meanwhile
+    unsigned ds_seq;
+    int pad2[3];
 };
+/// sum[t] += part[t] (D floats; part host-mapped, rows part_stride apart) for each token t < T with flag[t] (the CPU
+/// lane's part, added to the GPU's share of the RAM tier's experts: DS4_RT_SPLIT)
+void add_cpu_part(float* sum, const float* part, size_t part_stride, const int* flag, int T, int D, cudaStream_t s);
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
 /// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).  bonus (0: none):
 /// added to the pick score of an expert in VRAM from pick `keep` on (Options::cache_bonus / cache_keep; < 0: -bonus
@@ -235,6 +242,8 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    float ram_share = 0.0f);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
+/// The current device's wait_seq totals since the start: ns spent in it, calls, calls that had to wait.
+void wait_seq_stats(unsigned long long& ns, unsigned long long& calls, unsigned long long& stalls);
 /// A chunk's routed experts as sorted rows: the picks (t, i < k) of T tokens (idx rows kPicks apart) by the virtual
 /// slot vs[expert] (n_vs of them: the VRAM slots, then the experts streamed in), each slot's rows in token order:
 /// bounds[n_vs + 1], row_tok[r], pos[t][i] (the pick's sorted row, rows kPicks apart).
