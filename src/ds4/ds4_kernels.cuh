@@ -226,11 +226,13 @@ struct Resp {
 };
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
 /// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).  bonus (0: none):
-/// added to the pick score of an expert in VRAM from pick `keep` on (Options::cache_bonus / cache_keep).
+/// added to the pick score of an expert in VRAM from pick `keep` on (Options::cache_bonus / cache_keep; < 0: -bonus
+/// times the expert's own score), ram_share of it to one with ram[e] (host-mapped: its pages in the page cache).
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, float bonus = 0.0f, int keep = 0);
+                   unsigned vl = 0, float bonus = 0.0f, int keep = 0, const uint8_t* ram = nullptr,
+                   float ram_share = 0.0f);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
 /// A chunk's routed experts as sorted rows: the picks (t, i < k) of T tokens (idx rows kPicks apart) by the virtual

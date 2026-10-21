@@ -1841,7 +1841,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
                                                             const float* __restrict__ bias_vl, unsigned vl, float bonus,
-                                                            int keep) {
+                                                            int keep, const uint8_t* ram, float ram_share) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1859,9 +1859,14 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     for (int r = 0; r < k; ++r) {
-        if (bonus != 0.0f && r == keep) {   // (cache-aware routing, off at 0: the picks from `keep` on prefer VRAM's)
-            for (int q = threadIdx.x; q < n; q += blockDim.x)
-                if (vram[q] != 0ull && bs[q] != -FLT_MAX) bs[q] += bonus;
+        if (bonus != 0.0f && r == keep) {   // (cache-aware routing, off at 0: the picks from `keep` on prefer VRAM's -
+                                            // bonus < 0: |bonus| times the expert's own score)
+            for (int q = threadIdx.x; q < n; q += blockDim.x) {
+                if (bs[q] == -FLT_MAX) continue;
+                const float b = bonus > 0.0f ? bonus : -bonus * sc[q];
+                if (vram[q] != 0ull) bs[q] += b;
+                else if (ram != nullptr && ram[q] != 0) bs[q] += ram_share * b;   // (in the page cache: a share of it)
+            }
             __syncthreads();
         }
         float best = -FLT_MAX;
@@ -2319,9 +2324,9 @@ int cdiv(int a, int b) { return (a + b - 1) / b; }
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, float bonus, int keep) {
+                   unsigned vl, float bonus, int keep, const uint8_t* ram, float ram_share) {
     route_publish_kernel<<<T, 512, 0, s>>>(logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl, bonus, keep);
+                                           vl != 0 ? bias_vl : nullptr, vl, bonus, keep, ram, ram_share);
     if (req != nullptr) publish_kernel<<<1, 1, 0, s>>>(req, T, seq);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }

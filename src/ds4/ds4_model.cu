@@ -671,6 +671,7 @@ struct Layer {
     std::vector<uint8_t*> eaddr;
     std::vector<unsigned> demoted;   // (the window the cache last sent the expert back to the CPU lane; 0: never)
     std::vector<unsigned> cpu_seen;  // (the window the CPU lane last read the expert in; 0: never)
+    uint8_t* ram_ok = nullptr;       // (--ram-routing: host-mapped, 1 where an expert's pages are in the page cache)
     unsigned long long *vs_ptr_pin = nullptr, *vs_ptr_dev = nullptr;
     std::vector<int> vs_c0;
     // the expert cache: one VRAM slot and one set of host parts kept free, so an expert can move in while the one it
@@ -1111,6 +1112,8 @@ struct Model::Impl {
         }
         ds_cv.notify_all();
         if (ds_th.joinable()) ds_th.join();
+        rs_quit.store(true);
+        if (rs_th.joinable()) rs_th.join();
 
         for (auto& w : workers) w->stop();
         for (size_t i = 0; i < chunks.size(); ++i)
@@ -2348,7 +2351,21 @@ struct Model::Impl {
                 workers.back()->start();
             }
         if (!ds_init(err)) return false;
-        if (o.cache_bonus > 0.0f)
+        if (file_experts && o.cache_bonus != 0.0f && o.ram_share > 0.0f) {   // (--ram-routing: the scan's table, a first scan)
+            const double t0 = now_ms();
+            int n = 0;
+            for (Layer& l : L) {
+                if (l.mtp || l.poff.empty()) continue;
+                if (!hmap(l.ram_ok, (size_t) l.n_exp, err)) return false;
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0) l.ram_ok[e] = cold_share(l, e) < 0.05 ? 1 : 0, ++n;
+            }
+            std::fprintf(stderr, "ds4: ram-aware routing (--ram-routing %g): a CPU-lane expert in the page cache gets that share "
+                                 "of the cache-routing bonus (a scan of %d experts: %.0f ms)\n",
+                         (double) o.ram_share, n, now_ms() - t0);
+            rs_th = std::thread([this] { rs_loop(); });
+        }
+        if (o.cache_bonus != 0.0f)
             std::fprintf(stderr, "ds4: cache-aware routing (--cache-routing %g,%d): a routed expert in VRAM gets %g added to "
                                  "its score for decode's picks from pick %d on - approximate, the model's text changes\n",
                          (double) o.cache_bonus, o.cache_keep, (double) o.cache_bonus, o.cache_keep + 1);
@@ -3903,6 +3920,20 @@ struct Model::Impl {
         uint8_t* dst = nullptr;   // (its blob's place)
     };
     bool mx_on = false, user_cache = true;
+    // rs_th (--ram-routing): each CPU-lane expert's pages in the page cache or not (mincore), every layer over and over
+    std::thread rs_th;
+    std::atomic<bool> rs_quit{false};
+    void rs_loop() {
+        while (!rs_quit.load(std::memory_order_relaxed)) {
+            for (const Layer& l : L) {
+                if (l.ram_ok == nullptr) continue;
+                for (int e = 0; e < l.n_exp && !rs_quit.load(std::memory_order_relaxed); ++e)
+                    if (l.slot[(size_t) e] < 0) *(volatile uint8_t*) &l.ram_ok[e] = cold_share(l, e) < 0.05 ? 1 : 0;
+            }
+            for (int i = 0; i < 20 && !rs_quit.load(std::memory_order_relaxed); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
 
     std::vector<MxFill> mx_fills;
     unsigned mx_clock = 1;
@@ -6789,7 +6820,7 @@ struct Model::Impl {
             const bool lead = mi == 0;
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
-                          l.mtp ? 0.0f : o.cache_bonus, o.cache_keep);
+                          l.mtp ? 0.0f : o.cache_bonus, o.cache_keep, l.ram_ok, o.ram_share);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;

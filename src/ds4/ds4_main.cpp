@@ -61,7 +61,7 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--prefill-keep exact|off|N]\n"
                  "           [--dspark on|off|none] [--dspark-conf F]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto] [--cache-routing B[,P]]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--cache-routing B[,P[,r]]] [--ram-routing F]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
@@ -589,11 +589,13 @@ int main(int argc, char** argv) {
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
+        else if (a == "--ram-routing") o.ram_share = std::max(0.0f, std::min(1.0f, (float) std::atof(val("--ram-routing").c_str())));
         else if (a == "--cache-routing") {   // B[,P]: the bonus, from pick P on (0: every pick)
-            const std::string v = val("--cache-routing");
+            const std::string v = val("--cache-routing");   // (B[,P[,r]]: r - B times the expert's own score)
             o.cache_bonus = std::max(0.0f, (float) std::atof(v.c_str()));
             const size_t c = v.find(',');
             o.cache_keep = c == std::string::npos ? 0 : std::max(0, std::atoi(v.c_str() + c + 1));
+            if (c != std::string::npos && v.find(",r", c + 1) != std::string::npos) o.cache_bonus = -o.cache_bonus;
         }
         else if (a == "--prefill-keep") {   // a long prompt's consumer layers over its tail: exact, off, or its last N rows
             const std::string v = val("--prefill-keep");

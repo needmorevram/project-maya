@@ -52,6 +52,9 @@ struct Options {
     // quality: the model's text changes
     float cache_bonus = 0.0f;
     int cache_keep = 0;               // (with cache_bonus) the first picks chosen as the model would: the bonus from this one on
+    // (with cache_bonus, experts read in place) this share of the bonus to a CPU-lane expert whose pages are in the page
+    // cache (a scan of the mappings, mincore): one the SSD would have to read gives way to it
+    float ram_share = 0.0f;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;
