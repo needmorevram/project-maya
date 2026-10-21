@@ -557,6 +557,7 @@ struct KMoe {
     float limit;
     const int* skip;     // set_skip's flag (nullptr: none)
     int hdr;             // each blob's layout its own (BlobHdr): the *_hdr kernels
+    int stage;           // moe_down: MoeArgs::stage
 };
 
 // the pieces the token's experts (moe_*_kernel) and a window's grouped experts (win_*_kernel) share, so each window
@@ -671,15 +672,8 @@ __device__ __forceinline__ void moe_down_rows(const KMoe& a, const uint8_t* blob
                       1, sm);
     if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + svh) + g * kCols, a.part + (size_t) ei * a.n_embd + g * kCols);
 }
-// the last block of each output block adds the experts up in plan order, then the CPU lane's part and the shared expert
-__device__ __forceinline__ void moe_down_combine(const KMoe& a, int& last) {
-    const int g = blockIdx.x;
-    __threadfence();
-    __syncthreads();
-    if (threadIdx.x == 0) last = atomicAdd(&a.cnt[g], 1u) == (unsigned) (a.k - 1);
-    __syncthreads();
-    if (!last) return;
-    __threadfence();
+// output block g's sum: the experts' rows in plan order, then the CPU lane's part and the shared expert
+__device__ __forceinline__ void moe_down_sum(const KMoe& a, int g) {
     if (threadIdx.x < kCols) {
         const int r = g * kCols + threadIdx.x;
         float p[8];
@@ -687,7 +681,25 @@ __device__ __forceinline__ void moe_down_combine(const KMoe& a, int& last) {
         a.out[r] = combine(a.plan_w, p, a.k, a.cpu_flag != nullptr && *a.cpu_flag ? a.cpu_part + r : nullptr,
                            a.sh_out != nullptr ? a.sh_out[r] : 0.0f);
     }
+}
+// the last block of each output block adds the experts up in plan order, then the CPU lane's part and the shared expert
+// (stage 1: none of it - moe_combine_kernel's, later)
+__device__ __forceinline__ void moe_down_combine(const KMoe& a, int& last) {
+    if (a.stage == 1) return;
+    const int g = blockIdx.x;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(&a.cnt[g], 1u) == (unsigned) (a.k - 1);
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    moe_down_sum(a, g);
     if (threadIdx.x == 0) a.cnt[g] = 0u;
+}
+// stage 2: each output block's sum alone (the rows came from a stage 1 launch before it on the stream)
+__global__ void moe_combine_kernel(const KMoe a) {
+    if (a.skip != nullptr && *a.skip) return;
+    moe_down_sum(a, (int) blockIdx.x);
 }
 template <int K, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_down_kernel(const KMoe a) {
@@ -1080,8 +1092,9 @@ __device__ __forceinline__ void store_acc(const float (&acc)[MT][2][4], float* T
 }
 
 struct GArgs {
-    const uint8_t* wbase;     // expert e's blob at wbase + e * stride (dense: 0, the offsets are pointers)
+    const uint8_t* wbase;     // expert e's blob at wbase + e * stride (dense: 0, the offsets are pointers) ...
     size_t stride;
+    const unsigned long long* wptr;   // ... or (non-null) at wptr[e]
     size_t tr[3], suh[3], svh[3];
     int ld[3];                // tiles per 16-row slice of each matrix
     const int* bounds;        // device: expert e's rows [bounds[e], bounds[e + 1]) (null: one matrix, rows [0, m))
@@ -1112,7 +1125,7 @@ __global__ void __launch_bounds__(kThreads) gemm_kernel(const GArgs a) {
     const int ne = a.bounds != nullptr ? a.bounds[e + 1] - a.bounds[e] : a.m;
     const int r0 = e0 + rb * BM, nrows = min(BM, ne - rb * BM);
     if (nrows <= 0) return;
-    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const uint8_t* blob = a.wptr != nullptr ? (const uint8_t*) a.wptr[e] : a.wbase + (size_t) e * a.stride;
     const uint32_t* tr = (const uint32_t*) (blob + a.tr[0]);
     const uint16_t* suh = (const uint16_t*) (blob + a.suh[0]);
     const uint16_t* svh = (const uint16_t*) (blob + a.svh[0]);
@@ -1190,7 +1203,7 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
     const int e0 = a.bounds[e] - a.row0, ne = a.bounds[e + 1] - a.bounds[e];
     const int r0 = e0 + rb * BM, nrows = min(BM, ne - rb * BM);
     if (nrows <= 0) return;
-    const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+    const uint8_t* blob = a.wptr != nullptr ? (const uint8_t*) a.wptr[e] : a.wbase + (size_t) e * a.stride;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     float acc[2][MT][2][4] = {};
     for (int k0 = 0; k0 < a.k; k0 += 128) {
@@ -1209,8 +1222,8 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const GArgs a) {
     store_acc(acc[0], T[0]);
     store_acc(acc[1], T[1]);
     __syncthreads();
-    const uint16_t* svg = (const uint16_t*) (a.wbase + (size_t) e * a.stride + a.svh[0]) + g * 128;
-    const uint16_t* svu = (const uint16_t*) (a.wbase + (size_t) e * a.stride + a.svh[1]) + g * 128;
+    const uint16_t* svg = (const uint16_t*) (blob + a.svh[0]) + g * 128;
+    const uint16_t* svu = (const uint16_t*) (blob + a.svh[1]) + g * 128;
     for (int rr = warp; rr < nrows; rr += kWarps) {
         float vg[4], vu[4];
 #pragma unroll
@@ -1657,12 +1670,21 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
 }
 
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
+#if !defined(STRATA_USE_HIP)
+    if (a.stage == 1 && use_legacy()) return;   // (v1.1.8's kernels: all of it at stage 2)
+#endif
     EXL3_LEGACY(moe_down(a, h, sh_out, out, s));
     KMoe m;
     if (!moe_args(a, m, s)) return;
     if (h != nullptr) m.h = const_cast<float*>(h);
     m.sh_out = sh_out;
     m.out = out;
+    m.stage = a.stage;
+    if (a.stage == 2) {
+        moe_combine_kernel<<<(unsigned) (m.n_embd / kCols), kCols, 0, s>>>(m);
+        launch_check("moe_down");
+        return;
+    }
     if (m.hdr) moe_down_hdr_kernel<<<dim3((unsigned) (m.n_embd / kCols), (unsigned) m.k), kThreads, 0, s>>>(m);
     else if (!dispatch<RunDown>(a.lay.K[2], a.lay.cb, m, s)) std::fprintf(stderr, "exl3 moe_down: K %d\n", a.lay.K[2]);
     launch_check("moe_down");
@@ -1713,12 +1735,17 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.n_ff = a.n_ff;
     w.limit = a.limit;
     w.hdr = a.lay.hdr;
-    if (w.hdr) {
+    if (a.stage == 2) {
+    } else if (w.hdr) {
         win_gu_hdr_kernel<<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(w);
         win_down_hdr_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads, 0, s>>>(w);
     } else if (!dispatch<RunWin>(a.lay.K[0], a.lay.cb, w, groups, s) ||
                !dispatch<RunWinDown>(a.lay.K[2], a.lay.cb, w, groups, s)) {
         return false;
+    }
+    if (a.stage == 1) {
+        launch_check("win_experts");
+        return true;
     }
     if (a.wait_ptr != nullptr) win_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
     win_combine_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s>>>(w);
@@ -1749,6 +1776,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
     tc::GArgs a{};
     a.wbase = sa.wbase;
     a.stride = sa.stride;
+    a.wptr = sa.wptr;
     for (int r = 0; r < 2; ++r) {
         a.tr[r] = sa.lay.trellis[r];
         a.suh[r] = sa.lay.suh[r];
@@ -1783,6 +1811,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
     tc::GArgs a{};
     a.wbase = sa.wbase;
     a.stride = sa.stride;
+    a.wptr = sa.wptr;
     a.tr[0] = sa.lay.trellis[2];
     a.suh[0] = sa.lay.suh[2];
     a.svh[0] = sa.lay.svh[2];

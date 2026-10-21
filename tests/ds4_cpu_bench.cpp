@@ -1,4 +1,4 @@
-// tests/ds4_cpu_bench.cpp - how fast does this CPU run DeepSeek-V4.1-Flash's EXL3 experts (5120 -> 2304 -> 5120, K 3)?
+// tests/ds4_cpu_bench.cpp - how fast does this CPU run DeepSeek-V4.1-Flash's EXL3 experts (5120 -> 2304 -> 5120, K 3; --K)?
 //
 //   ds4_cpu_bench [--threads N] [--node 0|1|-1] [--mode band|rows] [--experts N] [--per-call N] [--iters N]
 //
@@ -25,7 +25,7 @@ namespace kc = strata::kernels::cpu;
 static void* node_alloc(size_t bytes, int node) {
     void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) return nullptr;
-    madvise(p, bytes, MADV_HUGEPAGE);
+    if (!std::getenv("BENCH_NOHUGE")) madvise(p, bytes, MADV_HUGEPAGE);
     if (node >= 0) {
         unsigned long mask = 1ul << node;
         if (syscall(SYS_mbind, p, bytes, 2 /*MPOL_BIND*/, &mask, 64, 0) != 0) std::perror("mbind");
@@ -34,7 +34,7 @@ static void* node_alloc(size_t bytes, int node) {
 }
 
 int main(int argc, char** argv) {
-    int threads = 22, node = 0, n_exp = 64, per_call = 2, iters = 40;
+    int threads = 22, node = 0, n_exp = 64, per_call = 2, iters = 40, K = 3;   // (--K: the trellis bits, 1..8)
     std::string mode = "rows";
     for (int i = 1; i + 1 < argc; i += 2) {
         const std::string a = argv[i];
@@ -44,11 +44,12 @@ int main(int argc, char** argv) {
         else if (a == "--experts") n_exp = std::atoi(argv[i + 1]);
         else if (a == "--per-call") per_call = std::atoi(argv[i + 1]);
         else if (a == "--iters") iters = std::atoi(argv[i + 1]);
+        else if (a == "--K") K = std::atoi(argv[i + 1]);
     }
-    const int E = 5120, FF = 2304, K = 3;
+    const int E = 5120, FF = 2304;
     const size_t tb = (size_t) E / 16 * FF / 16 * 32 * K;   // one matrix's trellis
     std::vector<int> cpus;
-    for (int c = 0; c < 44; ++c)
+    for (int c = 0; c < (std::getenv("BENCH_HT") ? 88 : 44); ++c)   // (BENCH_HT: the hyperthreads 44.. after the cores)
         if (node < 0 || c % 2 == node) cpus.push_back(c);
     strata::ds4::Pool pool(threads - 1, std::vector<int>(cpus.begin() + 1, cpus.end()));
     {

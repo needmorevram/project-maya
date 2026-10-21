@@ -16,6 +16,8 @@
 #include "ds4_model.hpp"
 
 #include <cuda_profiler_api.h>
+#include <dirent.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -630,6 +632,30 @@ int main(int argc, char** argv) {
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
     o.vision_only = !enc_rgb.empty();
+    // one GPU, DS4_DSTREAM=1: its windows stream CPU-lane experts to the GPU (dstream), the service thread's answer
+    // then waiting on copies while the device spins for it - and CUDA's lazy loading, a kernel's code loaded at its
+    // first launch, waits for the device to go idle: a deadlock (seen at the second layer).  So every kernel loaded at
+    // the start there (~0.2 GB of VRAM; the load ~2x faster here); a setting the caller made stays
+    {
+        const char* dsv = std::getenv("DS4_DSTREAM");
+        int gpus = 0;
+        if (const char* cv = std::getenv("CUDA_VISIBLE_DEVICES"); cv != nullptr && *cv != '\0') {
+            gpus = 1;
+            for (const char* q = cv; *q; ++q) gpus += *q == ',';
+        } else if (DIR* dd = opendir("/proc/driver/nvidia/gpus")) {
+            while (const dirent* de = readdir(dd)) gpus += de->d_name[0] != '.';
+            closedir(dd);
+        }
+        // (the driver reads it as its library loads, before main: so the process starts again with it set)
+        if (dsv != nullptr && std::atoi(dsv) != 0 && gpus == 1 && std::getenv("CUDA_MODULE_LOADING") == nullptr) {
+            setenv("CUDA_MODULE_LOADING", "EAGER", 1);
+            execv("/proc/self/exe", argv);
+            std::fprintf(stderr, "strata-ds4: could not start again with CUDA_MODULE_LOADING=EAGER: decode streaming off\n");
+            setenv("DS4_DSTREAM", "0", 1);
+        } else if (const char* ml = std::getenv("CUDA_MODULE_LOADING"); ml != nullptr && std::strcmp(ml, "EAGER") != 0) {
+            setenv("DS4_DSTREAM", "0", 1);   // (lazy loading by the caller's choice: no streaming, no deadlock)
+        }
+    }
     strata::ds4::Model m;
     std::string err;
     if (!m.load(o, err)) {
@@ -836,6 +862,9 @@ int main(int argc, char** argv) {
     const double t2 = now_ms();
     const auto& s = m.stats();
     const double nt = std::max<double>(1.0, (double) (s.tokens - s0.tokens));
+    if (s.streamed > s0.streamed)
+        std::fprintf(stderr, "decode: the GPU took %lld of the CPU lane's experts (streamed over PCIe)\n",
+                     (long long) (s.streamed - s0.streamed));
     std::fprintf(stderr, "decode: %zu tokens in %.0f ms (%.2f tok/s); CPU lane: %lld of %lld experts; the cache moved %lld "
                          "(%lld in all)\n", out.size(), t2 - t1,
                  out.size() > 1 ? 1000.0 * (double) (out.size() - 1) / (t2 - t1) : 0.0,

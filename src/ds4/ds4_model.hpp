@@ -63,6 +63,7 @@ struct Stats {
     double cpu_ms = 0.0, gpu_wait_ms = 0.0;   // the CPU lane's time; the host's waits for the routing
     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
     int64_t swaps = 0;                // experts the cache moved into VRAM
+    int64_t streamed = 0;             // CPU-lane experts a one-GPU window copied to the GPU and ran there (dstream)
     int64_t drafts_offered = 0, drafts_accepted = 0, drafts_rounds = 0;
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
 };

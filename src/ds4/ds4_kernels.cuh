@@ -220,6 +220,9 @@ struct Resp {
     int pad[3];
     int cpu[kWin];   // 1: part[t] is the CPU lane's weighted sum for token t
     float part[kWin][kMaxDim];
+    // a one-GPU window's CPU-lane experts the GPU takes (dstream): pick (t, i)'s blob in the ring (0: not one), its weight
+    unsigned long long ds_ptr[kWin][kPicks];
+    float ds_w[kWin][kPicks];
 };
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
 /// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).

@@ -1,7 +1,8 @@
 // tests/ds4_moe_hdr.cu - the token path's routed experts with each blob's own layout (ExpertLayout::hdr, a SAGE pack's
 // experts: each matrix its own K): (1) a plan of one layout, headed blobs -> the same bits as the layer-wide layout's
 // kernels; (2) a plan of experts of other K (gate and up apart too) -> each expert's down rows as that expert alone gives
-// them, added up in plan order as the kernel does - the same bits.  Random trellis words (any decode a valid weight).
+// them, added up in plan order as the kernel does - the same bits; and moe_down's stages 1 then 2 (the rows, then the
+// combine alone) the same bits as one call.  Random trellis words (any decode a valid weight).
 //   nvcc -O3 -std=c++17 -arch=native -I include -I src/kernels/cuda tests/ds4_moe_hdr.cu src/kernels/cuda/exl3.cu \
 //        src/kernels/cuda/exl3_dense.cu src/kernels/cuda/exl3_legacy.cu -o build/ds4_moe_hdr
 #include "strata/kernels/exl3.hpp"
@@ -67,7 +68,7 @@ T* dev(const std::vector<T>& h) {
 }
 // the token path's output for the plan (blobs on the device) under lay
 std::vector<float> run(const std::vector<uint8_t*>& blobs, const std::vector<float>& w, const x3::ExpertLayout& lay,
-                       const float* dx, const float* dsh, int D, int FF, cudaStream_t s) {
+                       const float* dx, const float* dsh, int D, int FF, cudaStream_t s, bool staged = false) {
     std::vector<unsigned long long> pp;
     for (uint8_t* b : blobs) pp.push_back((unsigned long long) b);
     unsigned long long* dpp = dev(pp);
@@ -83,6 +84,11 @@ std::vector<float> run(const std::vector<uint8_t*>& blobs, const std::vector<flo
     a.n_ff = FF;
     a.limit = 10.0f;
     x3::moe_gate_up(a, dx, dh, s);
+    if (staged) {   // (the down rows, then the combine alone: as the engine runs them around its wait for the CPU lane)
+        a.stage = 1;
+        x3::moe_down(a, dh, dsh, dout, s);
+        a.stage = 2;
+    }
     x3::moe_down(a, dh, dsh, dout, s);
     std::vector<float> out(D);
     cudaStreamSynchronize(s);
@@ -130,6 +136,10 @@ int main() {
         }
         const std::vector<float> w = {0.3f, 0.1f, 0.25f, 0.05f, 0.2f, 0.1f};
         const std::vector<float> mixed = run(headed, w, lays[0], dx, dsh, D, FF, s);
+        const std::vector<float> staged = run(headed, w, lays[0], dx, dsh, D, FF, s, true);
+        const bool st_same = std::memcmp(mixed.data(), staged.data(), (size_t) D * 4) == 0;
+        std::printf("the down rows and the combine apart (stage 1, 2): %s\n", st_same ? "the same bits" : "DIFFER");
+        fails += !st_same;
         // each expert alone (weight 1, no shared expert): its down rows; added up in plan order, then the shared row
         std::vector<std::vector<float>> p(6);
         std::vector<float> zero(D, 0.0f);

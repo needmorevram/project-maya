@@ -114,6 +114,9 @@ struct MoeArgs {
     ExpertLayout lay;
     int k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;   // 0: no clamp
+    // moe_down: 0 all of it; 1 the device's experts' down rows alone (they need no CPU part: the caller can run them
+    // before its wait for the CPU lane); 2 the combine alone (the same stream, after a 1) - 1 then 2 give 0's bits
+    int stage = 0;
 };
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
@@ -146,6 +149,9 @@ struct WinArgs {
     // part arrives while the device computes the experts); cpu_flag may be null (no CPU part)
     const unsigned* wait_ptr = nullptr;
     unsigned wait_val = 0;
+    // 0: all of it; 1: the experts alone (gate / up, down into part); 2: the wait and the combine alone (the same
+    // arguments as its stage 1's but for the CPU part: what runs between the two may write it)
+    int stage = 0;
 };
 bool win_experts(const WinArgs& a, cudaStream_t s);
 /// Whether the current device runs the several-activation kernels (win_experts; mv's ncol > 1): every device does
@@ -159,6 +165,7 @@ bool mma_supported();
 struct SetArgs {
     const uint8_t* wbase = nullptr;
     size_t stride = 0;
+    const unsigned long long* wptr = nullptr;   // (given: device, expert e's blob at wptr[e] - wbase and stride unused)
     ExpertLayout lay;
     int n_exp = 0;
     const int* bounds = nullptr;
