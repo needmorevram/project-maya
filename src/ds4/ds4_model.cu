@@ -670,6 +670,7 @@ struct Layer {
     bool arena = false;
     std::vector<uint8_t*> eaddr;
     std::vector<unsigned> demoted;   // (the window the cache last sent the expert back to the CPU lane; 0: never)
+    std::vector<unsigned> cpu_seen;  // (the window the CPU lane last read the expert in; 0: never)
     unsigned long long *vs_ptr_pin = nullptr, *vs_ptr_dev = nullptr;
     std::vector<int> vs_c0;
     // the expert cache: one VRAM slot and one set of host parts kept free, so an expert can move in while the one it
@@ -4271,7 +4272,8 @@ struct Model::Impl {
     // DS4_CPU_STATS: the CPU lane's calls, entries, rows and each phase's time, printed with the profile's save
     double cpu_ph_ms[4] = {};
     long cpu_calls = 0, cpu_ents = 0, cpu_rows = 0;
-    long cold_ents[3] = {};   // (DS4_CPU_STATS: entries, those not wholly in the page cache, of them the cache's victims)
+    long cold_ents[3] = {};
+    double adv_ms = 0;   // (DS4_CPU_STATS: the read-ahead advice's time before the CPU lane's calls)   // (DS4_CPU_STATS: entries, those not wholly in the page cache, of them the cache's victims)
     double cold_pages = 0;
     std::atomic<uint64_t> cpu_job_ns[4] = {}, cpu_job_n[4] = {}, cpu_slow_n[4] = {}, cpu_slow_ns[4] = {}, cpu_slow_cpu_ns[4] = {};
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0) {
@@ -4946,8 +4948,19 @@ struct Model::Impl {
                             }
                         }
                     const double tc = now_ms();
-                    if (file_experts && mx_on)   // (in place: the request's experts read ahead at once, not fault by fault)
-                        for (const Ent& en : ents) advise_region(l, en.e, POSIX_FADV_WILLNEED);
+                    static const bool ahead = !std::getenv("DS4_MX_WILLNEED") || std::atoi(std::getenv("DS4_MX_WILLNEED")) != 0;
+                    // (in place: the request's experts read ahead at once, not fault by fault - each unless the CPU lane
+                    // read it in the last 64 windows: its pages are in the page cache still, the advice ~0.04 ms of
+                    // page-cache walking an expert on the way)
+                    if (file_experts && mx_on && ahead) {
+                        if (l.cpu_seen.empty()) l.cpu_seen.assign((size_t) l.n_exp, 0u);
+                        for (const Ent& en : ents) {
+                            unsigned& seen = l.cpu_seen[(size_t) en.e];
+                            if (seen == 0 || seen + 64 < mx_clock) advise_region(l, en.e, POSIX_FADV_WILLNEED);
+                            seen = mx_clock;
+                        }
+                    }
+                    if (cstats) adv_ms += now_ms() - tc;
                     cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim);
                     if (ds_mode.load(std::memory_order_relaxed) == 1)
                         ds_ms_ent = 0.8 * ds_ms_ent + 0.2 * (now_ms() - tc) / (double) ents.size();
@@ -7012,6 +7025,8 @@ struct Model::Impl {
     }
 
     void save_profile() const {
+        if (std::getenv("DS4_CPU_STATS") != nullptr && cpu_calls > 0)
+            std::fprintf(stderr, "CPU lane: the read-ahead advice %.3f ms a call\n", adv_ms / cpu_calls);
         if (std::getenv("DS4_CPU_STATS") != nullptr && cold_ents[0] > 0)
             std::fprintf(stderr, "CPU lane: %ld entries, %ld of them not wholly in the page cache (%.0f%% of their pages "
                                  "missing), %ld of those the cache's victims\n", cold_ents[0], cold_ents[1],
