@@ -1,10 +1,11 @@
 // src/kernels/cuda/exl3_dense.cu - the plain weights an exl3::Mat also carries (exl3_dense.cuh): DeepSeek's FP8 E4M3
 // with a UE8M0 scale per 32 x 32 block, and BF16, stored as a torch Linear's [n][k].
 //
-//   * mv: a block owns 32 outputs (4 a warp), its activations' inputs 256 at a time in shared memory; lane l takes
-//     inputs [8 l, 8 l + 8) of each 256 of its rows (one 8- or 16-byte load a row; the last 256 may be short, k a
-//     multiple of 32), F32 FMAs, the warp's sum by shuffles - each output's arithmetic the same whatever the job's other
-//     activations (a window's token gets the token path's bits);
+//   * mv: a block owns 32 outputs (4 a warp); lane l takes inputs [8 l, 8 l + 8) of each 256 of its rows (one 8- or
+//     16-byte load a row; the last 256 may be short, k a multiple of 32), F32 FMAs, the warp's sum by shuffles - each
+//     output's arithmetic the same whatever the job's other activations (a window's token gets the token path's bits).
+//     The weights of kAhead 256s are loaded before any of them is used and the activations come from global memory
+//     (L1), no barrier: a decode's matrices (one activation) are read at the memory's speed, not its latency's;
 //   * reconstruct_rows: the weight decoded to F16 / BF16 rows for the prompt path's GEMMs.
 // The FP8 codes are decoded with integer arithmetic (no cuda_fp8.h: the same code on every GPU and on HIP).
 #include "exl3_dense.cuh"
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <type_traits>
 
 namespace strata::kernels::exl3::dense {
 namespace {
@@ -26,6 +28,14 @@ __device__ __forceinline__ float e4m3(uint32_t b) {   // (no NaN in a weight)
     const uint32_t e = (b >> 3) & 0xfu, m = b & 7u;
     const float v = e != 0u ? __uint_as_float(((e + 120u) << 23) | (m << 20)) : (float) m * 0.001953125f;
     return __uint_as_float(__float_as_uint(v) | ((b & 0x80u) << 24));
+}
+// bytes 2h and 2h + 1 of v as E4M3 values, each exact in F32 (e4m3() of it): the byte's sign and its 7 bits under it
+// an F16's (sign, 5-bit exponent, mantissa) - E4M3's subnormals F16's too - is the value / 2^8, times 256 exactly
+__device__ __forceinline__ float2 e4m3x2_256(uint32_t v, int h) {
+    const uint32_t t = __byte_perm(v, 0u, h ? 0x3424u : 0x1404u);   // (each half: its byte << 8)
+    const uint32_t f16 = (t & 0x80008000u) | ((t >> 1) & 0x3f803f80u);
+    const float2 f = __half22float2(*(const __half2*) &f16);
+    return make_float2(f.x * 256.0f, f.y * 256.0f);
 }
 __device__ __forceinline__ float e8m0(uint32_t b) { return b != 0u ? __uint_as_float(b << 23) : 5.877471754e-39f; }
 __device__ __forceinline__ float bf16f(uint32_t h) { return __uint_as_float(h << 16); }
@@ -39,6 +49,7 @@ struct DJob {
     float alpha;
     int k, n, nc;
     size_t x_cs, y_cs;
+    bool x16;   // (each activation's inputs 16-byte aligned: float4 loads)
 };
 struct DBatch {
     DJob j[kMaxUnits];
@@ -69,9 +80,8 @@ __device__ __forceinline__ void row8(const DJob& J, int row, int i0, float w[8])
     }
 }
 
-template <int NC, bool FP8>
+template <int NC, bool FP8, int kAhead>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const DBatch b) {
-    __shared__ __align__(16) float xs[NC][kTile];
     if (b.skip != nullptr && *b.skip) return;
     int ji = 0;
     while ((int) blockIdx.x >= b.blk_end[ji]) ++ji;
@@ -79,35 +89,67 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const DBatch b) {
     const int blk = (int) blockIdx.x - (ji > 0 ? b.blk_end[ji - 1] : 0);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row0 = blk * kRowsB + warp * kRowsW;
+    using Q = typename std::conditional<FP8, uint2, uint4>::type;   // (a row's 8 weights)
     float acc[kRowsW][NC];
 #pragma unroll
     for (int r = 0; r < kRowsW; ++r)
 #pragma unroll
         for (int c = 0; c < NC; ++c) acc[r][c] = 0.0f;
-    for (int k0 = 0; k0 < J.k; k0 += kTile) {
-        const int kt = min(kTile, J.k - k0);
-        __syncthreads();
-        for (int i = threadIdx.x; i < NC * kTile; i += kThreads) {
-            const int c = i / kTile, q = i % kTile;
-            if (q < kt) xs[c][q] = J.x[(size_t) c * J.x_cs + k0 + q];
-        }
-        __syncthreads();
-        if (lane * 8 >= kt) continue;   // (a short last 256: the lanes past it add nothing)
-        float xv[NC][8];
+    for (int k0 = 0; k0 < J.k; k0 += kAhead * kTile) {
+        // the kAhead 256s' weights first (a lane's 8 of each row; its scale: the 4 rows lie in one 32-row block)
+        Q q[kAhead][kRowsW];
+        float s8[kAhead];
 #pragma unroll
-        for (int c = 0; c < NC; ++c) {
-            const float4 a = *(const float4*) &xs[c][lane * 8], z = *(const float4*) &xs[c][lane * 8 + 4];
-            xv[c][0] = a.x, xv[c][1] = a.y, xv[c][2] = a.z, xv[c][3] = a.w;
-            xv[c][4] = z.x, xv[c][5] = z.y, xv[c][6] = z.z, xv[c][7] = z.w;
+        for (int a = 0; a < kAhead; ++a) {
+            const int i0 = k0 + a * kTile + lane * 8;
+            if (i0 >= J.k) continue;
+#pragma unroll
+            for (int r = 0; r < kRowsW; ++r)
+                q[a][r] = *(const Q*) (J.w + ((size_t) (row0 + r) * J.k + i0) * (FP8 ? 1 : 2));
+            if (FP8) s8[a] = e8m0(J.sc[(size_t) (row0 >> 5) * (J.k >> 5) + (i0 >> 5)]);
         }
 #pragma unroll
-        for (int r = 0; r < kRowsW; ++r) {
-            float w[8];
-            row8<FP8>(J, row0 + r, k0 + lane * 8, w);
+        for (int a = 0; a < kAhead; ++a) {
+            const int i0 = k0 + a * kTile + lane * 8;
+            if (i0 >= J.k) continue;   // (a short last 256: the lanes past it add nothing)
+            float xv[NC][8];
 #pragma unroll
-            for (int c = 0; c < NC; ++c)
+            for (int c = 0; c < NC; ++c) {
+                const float* xp = J.x + (size_t) c * J.x_cs + i0;
+                if (J.x16) {
+                    const float4 u = __ldg((const float4*) xp), z = __ldg((const float4*) xp + 1);
+                    xv[c][0] = u.x, xv[c][1] = u.y, xv[c][2] = u.z, xv[c][3] = u.w;
+                    xv[c][4] = z.x, xv[c][5] = z.y, xv[c][6] = z.z, xv[c][7] = z.w;
+                } else {
 #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[r][c] = __fmaf_rn(w[i], xv[c][i], acc[r][c]);
+                    for (int i = 0; i < 8; ++i) xv[c][i] = __ldg(xp + i);
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRowsW; ++r) {
+                float w[8];
+                if constexpr (FP8) {
+                    const uint2 v = q[a][r];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const float2 f = e4m3x2_256(i < 2 ? v.x : v.y, i & 1);
+                        w[2 * i] = f.x * s8[a];
+                        w[2 * i + 1] = f.y * s8[a];
+                    }
+                } else {
+                    const uint4 v = q[a][r];
+                    const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        w[2 * i] = bf16f(u[i] & 0xffffu);
+                        w[2 * i + 1] = bf16f(u[i] >> 16);
+                    }
+                }
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) acc[r][c] = __fmaf_rn(w[i], xv[c][i], acc[r][c]);
+            }
         }
     }
 #pragma unroll
@@ -153,10 +195,19 @@ __global__ void __launch_bounds__(kThreads) rows_kernel(const uint8_t* __restric
     *(uint4*) (dst + at * 8) = make_uint4(o[0], o[1], o[2], o[3]);
 }
 
+// the 256s a lane keeps in flight: a launch of few blocks (a decode's narrow matrices: 16 to 72 of them) wants each warp
+// to keep many loads going; one of many blocks wants the SM's warps (fewer registers each); several activations take
+// registers of their own (measured on an RTX 3090)
+template <int NC, bool FP8>
+void launch_ahead(const DBatch& b, int blocks, cudaStream_t s) {
+    if (NC > 1) mv_kernel<NC, FP8, 4><<<blocks, kThreads, 0, s>>>(b);
+    else if (blocks >= 128) mv_kernel<NC, FP8, 2><<<blocks, kThreads, 0, s>>>(b);
+    else mv_kernel<NC, FP8, 8><<<blocks, kThreads, 0, s>>>(b);
+}
 template <int NC>
 void launch_mv(const DBatch& b, int blocks, bool fp8, cudaStream_t s) {
-    if (fp8) mv_kernel<NC, true><<<blocks, kThreads, 0, s>>>(b);
-    else mv_kernel<NC, false><<<blocks, kThreads, 0, s>>>(b);
+    if (fp8) launch_ahead<NC, true>(b, blocks, s);
+    else launch_ahead<NC, false>(b, blocks, s);
 }
 
 }  // namespace
@@ -216,6 +267,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s, const int* skip) {
             J.nc = nc;
             J.x_cs = job.xf_cs;
             J.y_cs = job.y_cs;
+            J.x16 = ((uintptr_t) J.x & 15u) == 0 && (nc == 1 || job.xf_cs % 4 == 0);
             blocks += m.n / kRowsB;
             b.blk_end[b.n++] = blocks;
         }
