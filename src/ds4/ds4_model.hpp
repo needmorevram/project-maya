@@ -46,6 +46,12 @@ struct Options {
     // consumer layers + window rows - the state and the logits as with every row; N > 0 the last N rows (at least a
     // window), their windows cut at the tail's start (DeepInfer's bounded replay: approximate); -1 every row
     int prefill_keep = 0;
+    // (approximate, off: 0) cache-aware routing - a routed expert in VRAM gets this much added to its score for the
+    // pick (decode's router: not the prompt's chunks), so a CPU-lane expert ranked just above one in VRAM gives way to
+    // it; the picked experts' weights are still their own scores'.  Faster where the CPU lane bounds decode, at some
+    // quality: the model's text changes
+    float cache_bonus = 0.0f;
+    int cache_keep = 0;               // (with cache_bonus) the first picks chosen as the model would: the bonus from this one on
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;

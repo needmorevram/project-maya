@@ -669,6 +669,7 @@ struct Layer {
     // (plan_streams: vs_c0[c] .. vs_c0[c + 1] class c's, their blobs in vs_ptr_pin, a device copy in vs_ptr_dev)
     bool arena = false;
     std::vector<uint8_t*> eaddr;
+    std::vector<unsigned> demoted;   // (the window the cache last sent the expert back to the CPU lane; 0: never)
     unsigned long long *vs_ptr_pin = nullptr, *vs_ptr_dev = nullptr;
     std::vector<int> vs_c0;
     // the expert cache: one VRAM slot and one set of host parts kept free, so an expert can move in while the one it
@@ -960,6 +961,25 @@ struct Model::Impl {
                 posix_fadvise(pk.fds[(size_t) l.pfile[(size_t) e][(size_t) (3 * r + q)]],
                               (off_t) l.poff[(size_t) e][(size_t) (3 * r + q)], (off_t) C.piece_bytes[r][q], advice);
     }
+    // the share of expert e's pages (in place, pieces apart) the page cache does not have (mincore of its mapping)
+    double cold_share(const Layer& l, int e) const {
+        if (l.poff.empty()) return 0.0;
+        const Layer::XCls& C = xc(l, e);
+        const size_t pg = 4096;
+        size_t all = 0, cold = 0;
+        std::vector<unsigned char> v;
+        for (int r = 0; r < 3; ++r)
+            for (int q = 0; q < 3; ++q) {
+                uint8_t* a = piece_at(l, e, r, q);
+                uint8_t* a0 = (uint8_t*) ((uintptr_t) a & ~(uintptr_t) (pg - 1));
+                const size_t n = (size_t) ((a + C.piece_bytes[r][q] - a0) + pg - 1) / pg;
+                v.resize(n);
+                if (mincore(a0, n * pg, v.data()) != 0) continue;
+                for (unsigned char b : v) cold += (b & 1) == 0;
+                all += n;
+            }
+        return all ? (double) cold / (double) all : 0.0;
+    }
     // host side of the CPU lane, a window's rows
     float *h_x = nullptr, *h_w = nullptr, *h_part = nullptr;
     int* h_idx = nullptr;
@@ -1090,6 +1110,7 @@ struct Model::Impl {
         }
         ds_cv.notify_all();
         if (ds_th.joinable()) ds_th.join();
+
         for (auto& w : workers) w->stop();
         for (size_t i = 0; i < chunks.size(); ++i)
             if (chunks[i] && chunks[i]->blas) {
@@ -2200,6 +2221,28 @@ struct Model::Impl {
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
             pools.push_back(std::make_unique<Pool>(nw, c, 20000));   // spin through a token's layers (20 ms)
         }
+        // this thread, and every thread it starts from here on (the fills' copier, the readers, Engram's, CUDA's), off
+        // the CPU lane's cores: on the allowed CPUs the lane leaves (the cores' other hyperthreads) - one woken on a
+        // lane core took it from a pool thread in the middle of a job (on the 1.62-bit pack, one GPU: ~3 jobs a call
+        // 7x their time, ~0.9 ms, while the cache's fills ran).  The service thread pins itself to its core after.
+        // DS4_HELPERS_APART=0: as before
+        if (!std::getenv("DS4_HELPERS_APART") || std::atoi(std::getenv("DS4_HELPERS_APART")) != 0) {
+            cpu_set_t aff, help;
+            CPU_ZERO(&aff);
+            CPU_ZERO(&help);
+            if (sched_getaffinity(0, sizeof aff, &aff) == 0) {
+                for (int c = 0; c < CPU_SETSIZE; ++c)
+                    if (CPU_ISSET(c, &aff)) CPU_SET(c, &help);
+                for (const std::vector<int>& node : cores)
+                    for (int c : node) CPU_CLR(c, &help);
+                if (CPU_COUNT(&help) > 0) {
+                    sched_setaffinity(0, sizeof help, &help);
+                    if (o.verbose)
+                        std::fprintf(stderr, "ds4: the host's other threads on %d CPUs apart from the CPU lane's %zu cores\n",
+                                     CPU_COUNT(&help), cores.empty() ? (size_t) 0 : cores[0].size());
+                }
+            }
+        }
         {
             const size_t E = (size_t) g.dim, FF = (size_t) g.ff, GQ = E / 256, DQ = FF / 128, S = kSlots;
             c_xh.resize((size_t) NH * S * 2 * E);
@@ -2304,6 +2347,10 @@ struct Model::Impl {
                 workers.back()->start();
             }
         if (!ds_init(err)) return false;
+        if (o.cache_bonus > 0.0f)
+            std::fprintf(stderr, "ds4: cache-aware routing (--cache-routing %g,%d): a routed expert in VRAM gets %g added to "
+                                 "its score for decode's picks from pick %d on - approximate, the model's text changes\n",
+                         (double) o.cache_bonus, o.cache_keep, (double) o.cache_bonus, o.cache_keep + 1);
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         reset();
         return true;
@@ -3318,7 +3365,8 @@ struct Model::Impl {
                             failed.store(true);
                             break;
                         }
-                        if (file_experts)
+                        static const bool drop = !std::getenv("DS4_LOAD_DONTNEED") || std::atoi(std::getenv("DS4_LOAD_DONTNEED")) != 0;
+                        if (file_experts && drop)
                             advise_region(l, e, POSIX_FADV_DONTNEED);
                     } else if (!file_experts) {
                         for (int X = 0; X < NH; ++X) repack_part(l, e, region.data(), X, l.hh[(size_t) e][(size_t) X]);
@@ -3678,6 +3726,7 @@ struct Model::Impl {
             Chunk& c = *chunks[(size_t) l.dev];
             if (j.dst != nullptr) {   // a fill: its region read, its header, then by DMA into its VRAM slot
                 const int e = j.ex[0];
+
                 const Layer::XCls& C = xc(l, e);
                 std::string err;
                 if (read_region(l, e, mx_stage)) {
@@ -3688,7 +3737,9 @@ struct Model::Impl {
                     stream_expert(l, 0, e, j.dst, ds_cs, err, mx_stage);
                 }
                 cudaStreamSynchronize(ds_cs);   // (mx_stage again for the next one)
-                advise_region(l, e, POSIX_FADV_DONTNEED);   // (in VRAM now: its pages to the CPU lane's others)
+                // (in VRAM now: its pages to the CPU lane's others - DS4_MX_DONTNEED=0: kept, for the kernel's LRU to age)
+                static const bool drop = !std::getenv("DS4_MX_DONTNEED") || std::atoi(std::getenv("DS4_MX_DONTNEED")) != 0;
+                if (drop) advise_region(l, e, POSIX_FADV_DONTNEED);
                 {
                     std::lock_guard<std::mutex> lk(ds_mu);
                     ds_done = j.id;
@@ -3851,6 +3902,7 @@ struct Model::Impl {
         uint8_t* dst = nullptr;   // (its blob's place)
     };
     bool mx_on = false, user_cache = true;
+
     std::vector<MxFill> mx_fills;
     unsigned mx_clock = 1;
     // the arena's room for expert e (its class's blob bytes): the first gap of the layer's region (its VRAM experts' and
@@ -4006,6 +4058,8 @@ struct Model::Impl {
                     out.push_back(victim);
                 }
                 for (int victim : out) {
+                    if (l.demoted.empty()) l.demoted.assign((size_t) l.n_exp, 0u);
+                    l.demoted[(size_t) victim] = now;
                     l.slot[(size_t) victim] = -1;
                     if (l.arena) l.eaddr[(size_t) victim] = nullptr;
                     l.hh[(size_t) victim][0] = file_part(l, victim);
@@ -4189,11 +4243,20 @@ struct Model::Impl {
             for (int X = 0; X < NH; ++X)
                 g[X] = [this, &f, X, ph](int j) {
                     const auto t0 = std::chrono::steady_clock::now();
+                    timespec c0, c1;
+                    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c0);
                     f[X](j);
-                    cpu_job_ns[ph].fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                 std::chrono::steady_clock::now() - t0).count(),
-                                             std::memory_order_relaxed);
+                    const uint64_t ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() - t0).count();
+                    cpu_job_ns[ph].fetch_add(ns, std::memory_order_relaxed);
                     cpu_job_n[ph].fetch_add(1, std::memory_order_relaxed);
+                    if (ns > 400000) {   // (a job 3x its usual: its time on the CPU too - waiting, or running slow)
+                        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &c1);
+                        cpu_slow_n[ph].fetch_add(1, std::memory_order_relaxed);
+                        cpu_slow_ns[ph].fetch_add(ns, std::memory_order_relaxed);
+                        cpu_slow_cpu_ns[ph].fetch_add((uint64_t) ((c1.tv_sec - c0.tv_sec) * 1000000000LL + (c1.tv_nsec - c0.tv_nsec)),
+                                                      std::memory_order_relaxed);
+                    }
                 };
             for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, g[X]);
             pools[0]->help();
@@ -4208,7 +4271,9 @@ struct Model::Impl {
     // DS4_CPU_STATS: the CPU lane's calls, entries, rows and each phase's time, printed with the profile's save
     double cpu_ph_ms[4] = {};
     long cpu_calls = 0, cpu_ents = 0, cpu_rows = 0;
-    std::atomic<uint64_t> cpu_job_ns[4] = {}, cpu_job_n[4] = {};
+    long cold_ents[3] = {};   // (DS4_CPU_STATS: entries, those not wholly in the page cache, of them the cache's victims)
+    double cold_pages = 0;
+    std::atomic<uint64_t> cpu_job_ns[4] = {}, cpu_job_n[4] = {}, cpu_slow_n[4] = {}, cpu_slow_ns[4] = {}, cpu_slow_cpu_ns[4] = {};
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0) {
         if (ldx == 0) ldx = (size_t) g.dim;
         static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
@@ -4869,6 +4934,17 @@ struct Model::Impl {
                     ents.push_back(en);
                 }
                 if (!ents.empty()) {
+                    static const bool cstats = std::getenv("DS4_CPU_STATS") != nullptr;
+                    if (cstats && file_experts)   // (the CPU lane's entries not wholly in the page cache; the cache's victims)
+                        for (const Ent& en : ents) {
+                            const double cs = cold_share(l, en.e);
+                            ++cold_ents[0];
+                            if (cs > 0.0) {
+                                ++cold_ents[1];
+                                cold_pages += cs;
+                                if (!l.demoted.empty() && l.demoted[(size_t) en.e] != 0) ++cold_ents[2];
+                            }
+                        }
                     const double tc = now_ms();
                     if (file_experts && mx_on)   // (in place: the request's experts read ahead at once, not fault by fault)
                         for (const Ent& en : ents) advise_region(l, en.e, POSIX_FADV_WILLNEED);
@@ -6699,7 +6775,8 @@ struct Model::Impl {
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
-                          d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl);
+                          d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
+                          l.mtp ? 0.0f : o.cache_bonus, o.cache_keep);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
@@ -6935,6 +7012,10 @@ struct Model::Impl {
     }
 
     void save_profile() const {
+        if (std::getenv("DS4_CPU_STATS") != nullptr && cold_ents[0] > 0)
+            std::fprintf(stderr, "CPU lane: %ld entries, %ld of them not wholly in the page cache (%.0f%% of their pages "
+                                 "missing), %ld of those the cache's victims\n", cold_ents[0], cold_ents[1],
+                         cold_ents[1] ? 100.0 * cold_pages / cold_ents[1] : 0.0, cold_ents[2]);
         if (std::getenv("DS4_CPU_STATS") != nullptr && cpu_calls > 0)
             std::fprintf(stderr, "CPU lane: %ld calls, %.2f experts and %.2f rows a call; per call: gate/up %.3f ms, "
                                  "bands %.3f, down %.3f, down bands %.3f\n", cpu_calls, (double) cpu_ents / cpu_calls,
@@ -6948,9 +7029,11 @@ struct Model::Impl {
             const int thr = pools.empty() ? 1 : (int) (pools[0]->size() + (pools.size() > 1 ? pools[1]->size() : 0));
             for (int i = 0; i < 4; ++i)
                 std::fprintf(stderr, "  phase %d: %.1f jobs a call, %.1f us a job; the jobs' time %.0f%% of %d threads x the "
-                                     "phase's wall\n", i, (double) cpu_job_n[i] / cpu_calls,
-                             cpu_job_n[i] ? cpu_job_ns[i] / 1e3 / cpu_job_n[i] : 0.0,
-                             100.0 * cpu_job_ns[i] / 1e6 / (cpu_ph_ms[i] * thr), thr);
+                                     "phase's wall; jobs over 0.4 ms: %.3f a call, %.2f ms each (%.2f of it on the CPU)\n", i,
+                             (double) cpu_job_n[i] / cpu_calls, cpu_job_n[i] ? cpu_job_ns[i] / 1e3 / cpu_job_n[i] : 0.0,
+                             100.0 * cpu_job_ns[i] / 1e6 / (cpu_ph_ms[i] * thr), thr, (double) cpu_slow_n[i] / cpu_calls,
+                             cpu_slow_n[i] ? cpu_slow_ns[i] / 1e6 / cpu_slow_n[i] : 0.0,
+                             cpu_slow_n[i] ? cpu_slow_cpu_ns[i] / 1e6 / cpu_slow_n[i] : 0.0);
         }
         if (o.profile.empty()) return;
         const std::string tmp = o.profile + ".tmp";

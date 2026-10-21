@@ -61,7 +61,7 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--prefill-keep exact|off|N]\n"
                  "           [--dspark on|off|none] [--dspark-conf F]\n"
-                 "           [--vision on|off] [--mmap-experts on|off|auto]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto] [--cache-routing B[,P]]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
@@ -589,6 +589,12 @@ int main(int argc, char** argv) {
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
+        else if (a == "--cache-routing") {   // B[,P]: the bonus, from pick P on (0: every pick)
+            const std::string v = val("--cache-routing");
+            o.cache_bonus = std::max(0.0f, (float) std::atof(v.c_str()));
+            const size_t c = v.find(',');
+            o.cache_keep = c == std::string::npos ? 0 : std::max(0, std::atoi(v.c_str() + c + 1));
+        }
         else if (a == "--prefill-keep") {   // a long prompt's consumer layers over its tail: exact, off, or its last N rows
             const std::string v = val("--prefill-keep");
             o.prefill_keep = v == "exact" ? 0 : v == "off" ? -1 : std::max(1, std::atoi(v.c_str()));
@@ -676,11 +682,18 @@ int main(int argc, char** argv) {
             const std::vector<int> seq = parse_ids(line);
             if (seq.size() < 2) continue;
             m.reset();
-            if (!m.feed(seq.data(), (int) seq.size(), (int) seq.size(), err) || !m.logits(lg) ||
-                lg.size() < (seq.size() - 1) * (size_t) V) {
-                std::fprintf(stderr, "strata-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
-                return 1;
+            // (--prefill-chunk 0: windows of 16, each its rows' logits - the decode path's router, as a verify window's)
+            const size_t win = o.prefill_chunk == 0 ? 16 : seq.size();
+            std::vector<float> all;
+            for (size_t a = 0; a < seq.size(); a += win) {
+                const int T = (int) std::min(win, seq.size() - a);
+                if (!m.feed(seq.data() + a, T, T, err) || !m.logits(lg) || lg.size() < (size_t) T * V) {
+                    std::fprintf(stderr, "strata-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
+                    return 1;
+                }
+                all.insert(all.end(), lg.begin(), lg.begin() + (size_t) T * V);
             }
+            lg.swap(all);
             double s_nll = 0.0;
             for (size_t i = 0; i + 1 < seq.size(); ++i) {   // row i: the next token's log-probability
                 const float* r = lg.data() + i * (size_t) V;
@@ -696,6 +709,9 @@ int main(int argc, char** argv) {
         }
         std::printf("perplexity %.4f over %lld tokens of %d sequences\n", scored ? std::exp(nll / (double) scored) : 0.0,
                     scored, k);
+        const strata::ds4::Stats& ps = m.stats();
+        std::fprintf(stderr, "ppl: CPU lane %lld of %lld routed experts (%.1f%%)\n", (long long) ps.cpu_experts,
+                     (long long) ps.experts, ps.experts ? 100.0 * (double) ps.cpu_experts / (double) ps.experts : 0.0);
         return 0;
     }
 

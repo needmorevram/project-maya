@@ -1840,7 +1840,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
-                                                            const float* __restrict__ bias_vl, unsigned vl) {
+                                                            const float* __restrict__ bias_vl, unsigned vl, float bonus,
+                                                            int keep) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -1858,6 +1859,11 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     for (int r = 0; r < k; ++r) {
+        if (bonus != 0.0f && r == keep) {   // (cache-aware routing, off at 0: the picks from `keep` on prefer VRAM's)
+            for (int q = threadIdx.x; q < n; q += blockDim.x)
+                if (vram[q] != 0ull && bs[q] != -FLT_MAX) bs[q] += bonus;
+            __syncthreads();
+        }
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
         for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -2313,9 +2319,9 @@ int cdiv(int a, int b) { return (a + b - 1) / b; }
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl) {
+                   unsigned vl, float bonus, int keep) {
     route_publish_kernel<<<T, 512, 0, s>>>(logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl);
+                                           vl != 0 ? bias_vl : nullptr, vl, bonus, keep);
     if (req != nullptr) publish_kernel<<<1, 1, 0, s>>>(req, T, seq);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
