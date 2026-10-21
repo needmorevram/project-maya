@@ -1,0 +1,123 @@
+{
+ "_": "DeepSeek-V4.1-Flash-1017 at 1.62 bits for strata-ds4 (maya.py's DeepSeek setup): vcruz305's SAGE EXL3 pack - its routed experts in EXL3, each matrix its own K (1-4 bits), its attention, shared experts and DSpark drafter in DeepSeek's own FP8 (E4M3, a UE8M0 scale per 32 x 32 block), a few small tensors in BF16. Every file pinned to a revision, with its size and sha256. Its two Engram tables (shards 16 / 17) are DeepSeek's own, byte for byte the base repo's shards 47 / 48 (the same sha256): another DeepSeek quant's are linked under these names instead of downloaded again.",
+ "name": "DeepSeek-V4.1-Flash-1017",
+ "repo": "vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw",
+ "revision": "c852150e06f5e5ee8c4c14f9cd1a9afc6bb21960",
+ "license": "MIT",
+ "files": {
+  ".gitattributes": [
+   1641,
+   "f90bfdfb68634ca7fca6ab0e2fa09742601f1f11477b0c6cc67ae278c86ae02d"
+  ],
+  "LICENSE": [
+   1084,
+   "f2c6c602815669d292889e5be8c802f2ed950653b77999b1584e8e6aed25d040"
+  ],
+  "README.md": [
+   3491,
+   "1057dfd99e3ee148acd70837138b679a37e8372e94199cdcad9a1a72d5880fc7"
+  ],
+  "chat_template.jinja": [
+   4015,
+   "adaa16cddf2ed5415bb2518e72b514b9c8dbb750bcb8aa0b6a0de9c8e6b616b9"
+  ],
+  "config.json": [
+   3170,
+   "25882944c203b1970a9187dc47334ebafbb7e95ffda888fd86c8181af9e15867"
+  ],
+  "engram_token_map.u32": [
+   517120,
+   "c60a86322ec17b4142bfef3c57a8d81fb428550cdf487f88a4320cb59fe46481"
+  ],
+  "generation_config.json": [
+   191,
+   "96a22d3ec2d7c13d94641a2446a75ff0403f23d91f748f3e12e109aa0c9c2b7b"
+  ],
+  "model-00001-of-00017.safetensors": [
+   8295145608,
+   "ac51ca7efe935e1566d86be2ffabf2ab6df0083c38116315908e3ec8a9f34e8a"
+  ],
+  "model-00002-of-00017.safetensors": [
+   8300673580,
+   "272fc820c126affafe9dcc8a681038883df95d961a8a2171943327583691e084"
+  ],
+  "model-00003-of-00017.safetensors": [
+   8300799044,
+   "94f9f3822ebcdc36d52fe1f857ab8ab20f1974226d8d4e7c8694b7f45bee55a4"
+  ],
+  "model-00004-of-00017.safetensors": [
+   8297590736,
+   "01b3dc66064724819df25cd178abb25dcfa22dd00c567df26ce289fd5dfc3daa"
+  ],
+  "model-00005-of-00017.safetensors": [
+   8301345004,
+   "dfe1970998f68ca9fcd39cf649d403a1e918f48a87c7d13087ccb01a041f6afd"
+  ],
+  "model-00006-of-00017.safetensors": [
+   8299988556,
+   "e215bfb496c9f73c3d83f19054c22b2bff14f54a33c8bfb8174c4738f89e2801"
+  ],
+  "model-00007-of-00017.safetensors": [
+   8300835552,
+   "e08d5d61cffd5f0bcdfd7327f77ded6200aaaa924470fd93fba831a83c6adaaa"
+  ],
+  "model-00008-of-00017.safetensors": [
+   8299401632,
+   "13d9071eaedd9ebf3224c40bd9730ed7e1a76abaacd61289a60c9847dbab9a29"
+  ],
+  "model-00009-of-00017.safetensors": [
+   8301110600,
+   "9d766562049a4d2990a5d72439403db00d87f983c05e9e395deee98a4ff525e0"
+  ],
+  "model-00010-of-00017.safetensors": [
+   8298765916,
+   "cd48078a47acfc8c4501be4cf5dd2200addccd3f5cc3a30788df1c20f06427a0"
+  ],
+  "model-00011-of-00017.safetensors": [
+   8300276688,
+   "512060b23fe2f1142a8c097fb3dab548bdf81dc3214dc64666796028f7bc3b75"
+  ],
+  "model-00012-of-00017.safetensors": [
+   8299458932,
+   "45ab31bd41e4c6bb9fe774825688beec791a197e977040ced56cce9913da5d11"
+  ],
+  "model-00013-of-00017.safetensors": [
+   8299591900,
+   "8e21d07bd569f8fa3bbb566cd5034b0a8bda0b53bb168c93691334bc4d7465f2"
+  ],
+  "model-00014-of-00017.safetensors": [
+   8300764172,
+   "dda9dbaab1a1de9179d7cc4f5fde6933f613718568492bccc649e82d2901c998"
+  ],
+  "model-00015-of-00017.safetensors": [
+   7300427020,
+   "e1ec37b0da1605cc304c8039fa47a24155e3adbdb37da060659488d7bade9bf2"
+  ],
+  "model.safetensors.index.json": [
+   14589080,
+   "80f31f1eee3e100d170744d6a5f2287c7c14ed1e7dc34dcc4a0b8eaaf2a810b1"
+  ],
+  "tokenizer.json": [
+   6367257,
+   "c90dfa01249db1be4245780a052ede752e1361c612ac6d08e2bdada7d599476b"
+  ],
+  "tokenizer_config.json": [
+   801,
+   "6ac8c8dc065ed118161d02dd532749ae3f52c243deac27872134fae2f50d8547"
+  ]
+ },
+ "engram": {
+  "repo": "vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw",
+  "revision": "c852150e06f5e5ee8c4c14f9cd1a9afc6bb21960",
+  "files": {
+   "model-00016-of-00017.safetensors": [
+    101535150936,
+    "76a05106ece259be83d1bfea0dcb54f23377864ee60fd321690f35e6698a2af5"
+   ],
+   "model-00017-of-00017.safetensors": [
+    101537926640,
+    "9dc51433e195bc78b5ad846b68643cc0351d3b174e5e4309222d3b7402c83afd"
+   ]
+  }
+ }
+}

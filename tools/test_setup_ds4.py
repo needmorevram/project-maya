@@ -135,6 +135,70 @@ class Quant35(unittest.TestCase):
         self.assertEqual(json.loads((d / maya.VERIFIED).read_text()), book)
 
 
+class Quant162(unittest.TestCase):
+    """The 1.62-bit SAGE quant: picked by --model or the menu, its own pinned manifest (its Engram tables its repo's
+    shards 16 / 17, DeepSeek's 47 / 48 byte for byte), a hand download's folder found by its repo's name, the tables
+    linked across the two namings either way."""
+
+    def test_picked(self):
+        self.assertEqual(maya.choose_family(args(model=maya.DS4_162), {}), "deepseek")
+        a = args()
+        with patch.object(maya.S, "gpus", return_value=[]), patch.object(maya, "say", lambda *x: None):
+            self.assertEqual(maya.choose_family(a, {"installer": {"family": "deepseek", "quant": maya.DS4_162}}),
+                             "deepseek")
+        self.assertEqual(a.model, maya.DS4_162)                # (the setup before: the default row)
+        self.assertEqual(maya.ds4_quant(args(), {"installer": {"quant": maya.DS4_162}}), maya.DS4_162)
+
+    def test_every_file_pinned(self):
+        m = maya.ds4_model(maya.DS4_162)
+        for n in ["config.json", "model.safetensors.index.json", "tokenizer.json"] + \
+                 [f"model-{i:05d}-of-00017.safetensors" for i in range(1, 18)]:
+            self.assertIn(n, m["files"])
+        for n, size in m["files"].items():
+            self.assertNotIn("/", n)
+            self.assertGreater(size, 0)
+            self.assertRegex(m["sha256"][n], r"^[0-9a-f]{64}$")
+        self.assertAlmostEqual(m["download_gb"], 326.6, delta=0.5)
+        self.assertIn("1.62 bits", m["about"])
+        self.assertIn("SAGE", m["about"])
+        u = maya.file_url(m, "model-00017-of-00017.safetensors")
+        self.assertTrue(u.startswith("https://huggingface.co/vcruz305/DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw/"))
+        self.assertRegex(u, re.compile(r"/resolve/[0-9a-f]{40}/"))
+        # its tables are the 2.9-bit setup's (DeepSeek's), under its own names
+        b = maya.ds4_model(maya.DS4)
+        self.assertEqual(sorted(m["sha256"][n] for n in m["sources"]), sorted(b["sha256"][n] for n in b["sources"]))
+        self.assertEqual(maya.ds4_engram_names(m["sha256"]["model-00016-of-00017.safetensors"]),
+                         ["model-00047-of-00048.safetensors", "model-00016-of-00017.safetensors"])
+
+    def test_hand_download_folder(self):
+        models = Path(tempfile.mkdtemp())
+        own = models / "DSV4.1-Flash-1017-SAGE-EXL3-1.62bpw"
+        own.mkdir()
+        (own / "config.json").write_text("{}")
+        self.assertEqual(maya.ds4_dir(args(), models, {}, maya.DS4_162), own)
+        (models / maya.DS4_162).mkdir()                        # (the setup's own name, once there, first)
+        self.assertEqual(maya.ds4_dir(args(), models, {}, maya.DS4_162), models / maya.DS4_162)
+
+    def _linked(self, have_q, want_q):
+        models = Path(tempfile.mkdtemp())
+        mh, mw = maya.ds4_model(have_q), maya.ds4_model(want_q)
+        have = models / have_q
+        have.mkdir()
+        for n in mh["sources"]:
+            with open(have / n, "wb") as f:
+                f.truncate(mh["files"][n])
+        d = models / want_q
+        with patch.object(maya, "ok", lambda *x: None), patch.object(maya, "configs", return_value=[]):
+            maya.ds4_link_engram(d, mw, models, {})
+        by_sha = {mh["sha256"][n]: n for n in mh["sources"]}
+        for n in mw["sources"]:
+            self.assertEqual((d / n).stat().st_ino, (have / by_sha[mw["sha256"][n]]).stat().st_ino)
+
+    def test_engram_linked_both_ways(self):
+        self._linked(maya.DS4, maya.DS4_162)     # DeepSeek's 47 / 48 -> the SAGE quant's 16 / 17
+        self._linked(maya.DS4_162, maya.DS4_35)  # and back
+
+
 GPUS3 = [{"index": i, "name": "RTX 5060 Ti", "vram_gb": 15.9} for i in range(3)]
 
 
